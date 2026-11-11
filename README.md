@@ -97,6 +97,20 @@ DropBridge\
 </details>
 
 <details>
+<summary><b>为什么不能从电脑发文件给 iPhone / Mac</b></summary>
+
+隔空投送的发送方必须向接收方证明自己的身份，这一步 DropBridge 过不去：
+
+1. **前面都走通了。** 蓝牙 beacon 唤醒手机、发现手机、拿到地址和端口、建立 TCP 连接、发起 TLS 握手，这些都已在真机上验证。
+2. **卡在证书。** iPhone 收到 DropBridge 的证书后，直接用 TLS alert 断开连接（上游日志为 `Unwilling`）。手机的隔空投送已设为「所有人」，所以问题不只出在「仅联系人」上。
+3. **很可能绕不过去。** Apple 设备之间互传时，发送方会附带由 Apple 签发的身份记录（`SenderRecordData`），只有登录了 Apple ID 的 Apple 设备才拿得到，自签证书无法伪造。iPhone 拒绝的确切 alert 类型没有抓到，所以「缺这份记录」是推断，不是实测结论。
+
+因此发送方向已在 2026-11-04 确认无法实现并停止开发（Q48），DropBridge 只做接收。排查过程见 [docs/SEND_PATH.md](docs/SEND_PATH.md)。
+
+> 以上结论只在 iPhone 上实测过，**Mac 没有测试过**。macOS 对发送方证书的校验可能比 iOS 宽松，但本项目没有做过验证，也不提供这个功能。
+</details>
+
+<details>
 <summary><b>Windows 弹 SmartScreen 警告</b></summary>
 
 程序没有代码签名，属预期现象。
