@@ -1281,3 +1281,11 @@ adio/queue；三轮未崩，但更干净的做法是让 RX transfer 可取消（
 - README 阅读入口加入该文档；`tools/check_project.py` 的必需清单同步。
 - 当前实测：最好 1121 KB/s（29.46 MB / 26.26 s）；社交时隙 + 快切后起步 930 帧/s，随后因射频退化中断；1 小时常驻采样无泄漏（AirBridge32 33–37 MB 工作集 / ~421 句柄）。
 - 蓝牙接口仍是 Error（软件 USB 复位造成），需重启系统恢复，不影响 AirDrop。
+
+## 2026-11-16：打包期校验驱动包签名完整性（修 v0.1.0-internal.1 的 CRLF 事故）
+
+- 用户机器（干净 Windows、autocrlf 环境）首次运行驱动自动安装失败：`pnputil /add-driver` 报「文件的哈希值不在指定的目录文件中」。排查：发布包内 `setup\driver\airbridge-winusb.inf` 是 CRLF（SHA-1 `e54610e9…`），而 cat 签名覆盖的是 LF 字节（`d715e4ea3912d32b361b95624c3e9ef2396d9f9e`）；`.gitattributes` 的 `packaging/driver/*.inf -text` 是 Q70 才加的，发布包出自修复前的旧工作树，RELEASE_CHECKLIST 对应检查项也未勾选。
+- 修复：新增 `tools/Assert-DriverPackage.ps1`——把 INF 的 SHA-1 与 cat 内嵌的 CTL 成员哈希逐字节比对（makecat 把成员哈希以裸 20 字节存在 CTL 里），不依赖 signtool/WDK/证书存储，PS 5.1 与 7 均可跑；`Package-Distributable.ps1` 与 `Package-Headless.ps1` 在 staging 驱动文件后立即调用它，哈希不符直接 throw，坏包出不了厂。
+- 验证：三个脚本语法解析通过；对仓库内 `packaging\driver`（LF）返回 OK 且打印 `d715e4ea…`；对人工构造的 CRLF 副本（即发布包里的坏文件，`e54610e9…`）正确抛错拦截。
+- 用户侧临时解法（已执行）：用仓库 LF 版 inf 覆盖发布包内 CRLF 版后重试安装。
+- 教训：RELEASE_CHECKLIST 里「autocrlf 克隆下 inf 哈希不变」一项必须勾选后再发包；本次把该校验从"人肉清单"变成"打包脚本硬失败"。
