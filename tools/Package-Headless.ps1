@@ -84,6 +84,9 @@ if (Test-Path (Join-Path $driverSource 'airbridge-winusb.cat')) {
     foreach ($name in 'airbridge-winusb.inf', 'airbridge-winusb.cat', 'dropbridge-driver.cer') {
         Copy-Item (Join-Path $driverSource $name) (Join-Path $stage 'setup\driver') -Force
     }
+    # Same guard as Package-Distributable.ps1: a CRLF-converted INF fails
+    # pnputil on the user's machine ("hash not in catalog"), so catch it here.
+    & (Join-Path $PSScriptRoot 'Assert-DriverPackage.ps1') -DriverDir (Join-Path $stage 'setup\driver')
 }
 Copy-Item (Join-Path $root 'tools\Start-Chain.ps1') (Join-Path $stage 'tools') -Force
 # Q62: notification helpers, used by the tray in the single-file payload too.

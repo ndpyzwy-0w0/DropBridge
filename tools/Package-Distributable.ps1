@@ -133,6 +133,10 @@ if (Test-Path (Join-Path $driverSource 'airbridge-winusb.cat')) {
     Copy-Item (Join-Path $driverSource 'airbridge-winusb.inf') (Join-Path $stage 'setup\driver') -Force
     Copy-Item (Join-Path $driverSource 'airbridge-winusb.cat') (Join-Path $stage 'setup\driver') -Force
     Copy-Item (Join-Path $driverSource 'dropbridge-driver.cer') (Join-Path $stage 'setup\driver') -Force
+    # v0.1.0-internal.1 shipped a CRLF INF whose hash the signed catalog does
+    # not contain, so every first-run pnputil install failed on the user's
+    # machine. Verify the staged bytes against the catalog before shipping.
+    & (Join-Path $PSScriptRoot 'Assert-DriverPackage.ps1') -DriverDir (Join-Path $stage 'setup\driver')
 }
 
 $commit = (& git rev-parse --short HEAD 2>$null)
