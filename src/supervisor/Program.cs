@@ -1110,6 +1110,146 @@ internal static class RadioBinding
         return string.Equals(service, "WinUSB", StringComparison.OrdinalIgnoreCase);
     }
 
+    // The dongle's Bluetooth half (MI_00). DropBridge never uses it - the
+    // beacon advertises over the machine's own radio (BluetoothLEAdvertisement
+    // -Publisher picks the system default) - and Windows keeps only ONE active
+    // Bluetooth radio at a time ("一次仅支持一个活动的蓝牙无线收发器", BTHUSB
+    // event 6). Plugging the card in therefore evicted the built-in radio on a
+    // user machine (2026-11-16). Disabling MI_00 is a device-state change
+    // (ConfigFlags), not a driver replacement, and is reversible from the tray
+    // menu or Device Manager.
+    private const string BluetoothPattern = "USB\\\\VID_0BDA&PID_C820&MI_00";
+
+    /// <summary>
+    /// State of the dongle's Bluetooth interface (MI_00):
+    /// 0 = absent, 1 = present and started, 2 = present and disabled
+    /// (CM_PROB_DISABLED, code 22), -1 = query failed.
+    /// </summary>
+    internal static int BluetoothState()
+    {
+        try
+        {
+            using (var searcher = new ManagementObjectSearcher(
+                       "SELECT DeviceID, ConfigManagerErrorCode FROM Win32_PnPEntity WHERE DeviceID LIKE '" +
+                       BluetoothPattern + "%'"))
+            {
+                foreach (ManagementObject item in searcher.Get())
+                {
+                    uint problem = 0;
+                    try { problem = Convert.ToUInt32(item["ConfigManagerErrorCode"] ?? 0u); }
+                    catch { }
+                    return problem == 22 ? 2 : 1;
+                }
+            }
+            return 0;
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+
+    /// <summary>Instance id of the MI_00 interface, null when absent or the query failed.</summary>
+    internal static string BluetoothDeviceId()
+    {
+        try
+        {
+            using (var searcher = new ManagementObjectSearcher(
+                       "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID LIKE '" + BluetoothPattern + "%'"))
+            {
+                foreach (ManagementObject item in searcher.Get())
+                {
+                    return item["DeviceID"] as string;
+                }
+            }
+        }
+        catch
+        {
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Same as SetBluetooth, but elevating once through the same --install-driver
+    /// pattern when the tray is not already admin.
+    /// </summary>
+    internal static int SilenceBluetooth(bool disable, string logPath)
+    {
+        int state = BluetoothState();
+        if (state == 0)
+        {
+            Log(logPath, "dongle-bt: MI_00 not present; nothing to do");
+            return 3;
+        }
+        if (state == (disable ? 2 : 1))
+        {
+            Log(logPath, "dongle-bt: already " + (disable ? "disabled" : "enabled") + "; nothing to do");
+            return 0;
+        }
+        if (!IsAdmin())
+        {
+            try
+            {
+                var start = new ProcessStartInfo(Application.ExecutablePath)
+                {
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    Arguments = "--dongle-bt " + (disable ? "disable" : "enable") +
+                                " --log " + Supervisor.QuoteArgument(logPath),
+                };
+                using (Process child = Process.Start(start))
+                {
+                    child.WaitForExit();
+                    Log(logPath, "dongle-bt: elevated helper exit " + child.ExitCode);
+                    return child.ExitCode;
+                }
+            }
+            catch (Exception error)
+            {
+                Log(logPath, "dongle-bt: elevation refused: " + error.Message);
+                return 2;
+            }
+        }
+        return SetBluetooth(disable, logPath);
+    }
+
+    /// <summary>
+    /// Disable (or re-enable) the dongle's Bluetooth interface with pnputil.
+    /// Must run elevated. Returns 0 on success or when already in the target
+    /// state, 3 when the interface is absent, 2 when not elevated, 1 on
+    /// failure. pnputil /disable-device needs Windows 11; on Windows 10 the
+    /// call fails, which the caller turns into the Device Manager hint.
+    /// </summary>
+    internal static int SetBluetooth(bool disable, string logPath)
+    {
+        int state = BluetoothState();
+        if (state == 0)
+        {
+            Log(logPath, "dongle-bt: MI_00 not present; nothing to do");
+            return 3;
+        }
+        if (state == (disable ? 2 : 1))
+        {
+            Log(logPath, "dongle-bt: already " + (disable ? "disabled" : "enabled") + "; nothing to do");
+            return 0;
+        }
+        if (!IsAdmin())
+        {
+            Log(logPath, "dongle-bt: not elevated");
+            return 2;
+        }
+        string id = BluetoothDeviceId();
+        if (id == null)
+        {
+            Log(logPath, "dongle-bt: instance id unavailable");
+            return 1;
+        }
+        int code = Run("pnputil.exe", (disable ? "/disable-device \"" : "/enable-device \"") + id + "\"", logPath);
+        state = BluetoothState();
+        Log(logPath, "dongle-bt: after pnputil, state=" + state);
+        return (code == 0 && state == (disable ? 2 : 1)) ? 0 : 1;
+    }
+
     internal static string DriverDirectory(string root)
     {
         string[] candidates =
@@ -1194,6 +1334,16 @@ internal static class RadioBinding
         service = Service();
         bool bound = Bound(service);
         Log(logPath, "install: after pnputil, MI_02 service=" + (service ?? "<absent>"));
+
+        // Already elevated for the driver: silence the dongle's Bluetooth half in
+        // the same run so Windows does not evict the machine's own radio. Failure
+        // here is not fatal - AWDL reception works without it - so it never turns
+        // a successful install into an error.
+        if (bound)
+        {
+            int bt = SetBluetooth(true, logPath);
+            Log(logPath, "install: dongle Bluetooth disable -> " + bt);
+        }
         return bound ? 0 : 1;
     }
 
@@ -1480,6 +1630,7 @@ internal sealed class TrayApp : ApplicationContext
     private ToolStripMenuItem _nameItem;
     private ToolStripMenuItem _stillCopyItem;
     private ToolStripMenuItem _folderItem;
+    private ToolStripMenuItem _dongleBtItem;
     private string _beaconLog;
     private readonly Settings _prefs;
 
@@ -1520,6 +1671,13 @@ internal sealed class TrayApp : ApplicationContext
         _stillCopyItem = new ToolStripMenuItem("为实况图生成单图副本", null,
             delegate { ToggleStillCopy(); }) { Checked = _prefs.StillCopy, ToolTipText = "收到实况照片（HEIC/实况 JPG + MOV）时，在同目录生成一份 -still.jpg 静图，Windows 上直接可看" };
         menu.Items.Add(_stillCopyItem);
+        _dongleBtItem = new ToolStripMenuItem("禁用网卡自带的蓝牙", null,
+            delegate { ToggleDongleBluetooth(!_dongleBtItem.Checked); })
+        {
+            ToolTipText = "这张网卡（RTL8821CU）自带一个蓝牙接口，DropBridge 用不到它。Windows 同时只允许一个活动蓝牙，留着它会把电脑自带蓝牙挤下线。勾选=禁用网卡蓝牙（推荐），取消=恢复。"
+        };
+        menu.Items.Add(_dongleBtItem);
+        RefreshDongleBluetoothMenu();
         menu.Items.Add(new ToolStripMenuItem("重新启动后端", null, delegate { StartBackends(); }));
         menu.Items.Add(new ToolStripMenuItem("重置链路", null, delegate
         {
@@ -2391,10 +2549,23 @@ internal sealed class TrayApp : ApplicationContext
                     "没找到 RTL8821CU 网卡：请直插机箱后面板的 USB 口。", ToolTipIcon.Warning);
                 return;
             }
-            if (RadioBinding.Bound(service)) return;
+            if (RadioBinding.Bound(service))
+            {
+                // Driver is already bound (e.g. an upgrade over a working
+                // install, or the card was replugged into another port). The
+                // dongle's Bluetooth comes back enabled every time it is
+                // replugged, and Windows only keeps one active radio - offer to
+                // silence it again instead of letting the built-in Bluetooth
+                // vanish mid-session.
+                OfferSilenceDongleBluetooth();
+                return;
+            }
 
             DialogResult answer = MessageBox.Show(
                 "首次使用需要一次性安装驱动（把网卡的 Wi-Fi 接口绑定到 WinUSB）。\n\n" +
+                "同时会禁用这张网卡自带的蓝牙接口：DropBridge 用不到它，而 Windows\n" +
+                "同一时间只允许一个活动的蓝牙收发器，留着它会把电脑自带的蓝牙挤下线。\n" +
+                "随时可以从托盘菜单「网卡蓝牙（禁用中）」恢复。\n\n" +
                 "点「是」后 Windows 会弹出一次管理员确认，安装完成后会自动继续。\n" +
                 "如果不想现在做，可以从托盘菜单选「安装驱动（首次使用）」。",
                 "DropBridge 首次使用", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
@@ -2429,6 +2600,98 @@ internal sealed class TrayApp : ApplicationContext
                 MessageBox.Show("驱动安装没有完成，详见：\n" + DriverLog,
                     "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+        finally
+        {
+            Cursor.Current = Cursors.Default;
+        }
+    }
+
+    /// <summary>
+    /// Ask once whether to silence the dongle's Bluetooth (MI_00). Called when
+    /// the driver is already bound, so it only covers the case where the card
+    /// was replugged (Windows re-enables MI_00 on every re-enumeration) and the
+    /// built-in radio would otherwise be evicted mid-session.
+    /// </summary>
+    private void OfferSilenceDongleBluetooth()
+    {
+        if (RadioBinding.BluetoothState() != 1) return;
+        DialogResult answer = MessageBox.Show(
+            "检测到网卡自带的蓝牙接口处于启用状态。\n\n" +
+            "Windows 同一时间只允许一个活动的蓝牙收发器，这张网卡的蓝牙\n" +
+            "会把电脑自带的蓝牙挤下线（AirPods、鼠标等都会掉）。\n" +
+            "DropBridge 不使用网卡蓝牙，建议禁用它。\n\n" +
+            "点「是」禁用（会弹一次管理员确认），之后可随时从托盘菜单恢复。",
+            "DropBridge 蓝牙冲突", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (answer == DialogResult.Yes) ToggleDongleBluetooth(true);
+    }
+
+    /// <summary>
+    /// Sync the tray menu item with the real MI_00 state: checked (and worded as
+    /// already disabled) when the dongle Bluetooth is off, unchecked when on,
+    /// and greyed out when the card is not plugged in.
+    /// </summary>
+    private void RefreshDongleBluetoothMenu()
+    {
+        if (_dongleBtItem == null) return;
+        int state = RadioBinding.BluetoothState();
+        if (state == 0)
+        {
+            _dongleBtItem.Enabled = false;
+            _dongleBtItem.Checked = false;
+            _dongleBtItem.Text = "禁用网卡自带的蓝牙（未插网卡）";
+            return;
+        }
+        _dongleBtItem.Enabled = true;
+        if (state == 2)
+        {
+            _dongleBtItem.Checked = true;
+            _dongleBtItem.Text = "网卡蓝牙已禁用（点按恢复）";
+        }
+        else if (state == 1)
+        {
+            _dongleBtItem.Checked = false;
+            _dongleBtItem.Text = "禁用网卡自带的蓝牙";
+        }
+        else
+        {
+            _dongleBtItem.Enabled = false;
+            _dongleBtItem.Text = "禁用网卡自带的蓝牙（查询失败）";
+        }
+    }
+
+    /// <summary>
+    /// Disable or re-enable the dongle's Bluetooth interface. Runs the change
+    /// through one elevated helper invocation (same UAC pattern as the driver
+    /// install). On Windows 10 pnputil has no /disable-device, so fall back to
+    /// the Device Manager hint.
+    /// </summary>
+    private void ToggleDongleBluetooth(bool disable)
+    {
+        Cursor.Current = Cursors.WaitCursor;
+        try
+        {
+            int code = RadioBinding.SilenceBluetooth(disable, DriverLog);
+            if (code == 0)
+            {
+                _icon.ShowBalloonTip(4000, _icon.Text,
+                    disable ? "已禁用网卡蓝牙，电脑自带蓝牙不再被挤占。"
+                            : "已恢复网卡蓝牙。", ToolTipIcon.Info);
+            }
+            else if (code == 3)
+            {
+                MessageBox.Show("没找到网卡的蓝牙接口（网卡没插？）。\n插上后重试。",
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(
+                    "无法自动切换网卡蓝牙状态，详见：\n" + DriverLog + "\n\n" +
+                    "手动办法：设备管理器 → 蓝牙 → 右键「Realtek Bluetooth\n" +
+                    "Adapter」→ 禁用设备（恢复时选「启用设备」）。",
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            RefreshDongleBluetoothMenu();
         }
         finally
         {
@@ -3560,6 +3823,28 @@ internal static class Program
                             : installLog;
                         return RadioBinding.Install(resolved, quiet, log);
                     }
+                case "--dongle-bt":
+                    {
+                        // Elevated helper for the tray's Bluetooth toggle. The
+                        // state must be resolved before any device change so a
+                        // bad argument fails without touching hardware.
+                        if (index + 1 >= args.Length) return 2;
+                        string wanted = args[++index];
+                        bool disable;
+                        if (wanted == "disable") disable = true;
+                        else if (wanted == "enable") disable = false;
+                        else return 2;
+                        string btLog = null;
+                        for (int extra = index + 1; extra < args.Length; extra++)
+                        {
+                            if (args[extra] == "--log" && extra + 1 < args.Length) btLog = args[++extra];
+                        }
+                        if (string.IsNullOrEmpty(btLog))
+                        {
+                            btLog = Path.Combine(ResolveRoot(null), "data", "logs", "driver-install.txt");
+                        }
+                        return RadioBinding.SetBluetooth(disable, btLog);
+                    }
                 case "--autostart-on":
                     autostart = 1;
                     break;
@@ -3596,6 +3881,7 @@ internal static class Program
             "--root", "--data", "--check", "--out", "--smoke", "--auto-exit",
             "--channel", "--width", "--chanseq", "--no-tcp-merge", "--allow-send",
             "--autostart-on", "--autostart-off", "--install-driver", "--streams",
+            "--dongle-bt",
         };
         if (args.Length > 0 && Array.IndexOf(knownSwitches, args[0]) < 0)
         {
