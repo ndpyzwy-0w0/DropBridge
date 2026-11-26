@@ -7,12 +7,12 @@
 
 # DropBridge
 
-**在 Windows 上接收 iPhone 隔空投送的文件**
+**在 Windows 上与 iPhone 双向隔空投送（AirDrop）文件**
 
 iPhone 不用装 App · 不依赖 WSL2 或虚拟机 · 不影响电脑原有 Wi-Fi
 
 [![平台](https://img.shields.io/badge/平台-Windows%2010%20%2F%2011%20x64-0078D4)](#使用)
-[![网卡](https://img.shields.io/badge/网卡-RTL8821CU-555)](#使用)
+[![网卡](https://img.shields.io/badge/网卡-RTL8821CU%20%2F%208811CU-555)](#使用)
 [![状态](https://img.shields.io/badge/状态-内部测试-orange)](#状态与限制)
 [![许可证](https://img.shields.io/badge/许可证-MIT-green)](LICENSE)
 
@@ -22,7 +22,7 @@ iPhone 不用装 App · 不依赖 WSL2 或虚拟机 · 不影响电脑原有 Wi-
 
 ---
 
-DropBridge 是一个常驻托盘的程序。它通过 WinUSB 直接驱动一张专用的 **RTL8821CU USB 无线网卡**，在用户态跑 AWDL（隔空投送底层的无线协议），让 iPhone 把电脑当成普通的隔空投送设备。
+DropBridge 是一个常驻托盘的程序。它通过 WinUSB 直接驱动一张专用的 **RTL8821CU / RTL8811CU USB 无线网卡**，在用户态跑 AWDL（隔空投送底层的无线协议），让 iPhone 把电脑当成普通的隔空投送设备。
 
 ## 使用
 
@@ -31,42 +31,46 @@ DropBridge 是一个常驻托盘的程序。它通过 WinUSB 直接驱动一张�
 | | |
 | --- | --- |
 | 系统 | Windows 10 / 11 x64，系统自带 .NET Framework 4.8 即可 |
-| 网卡 | RTL8821CU，USB ID `0bda:c820`（只验证过这个 ID），建议直插不经 Hub |
+| 网卡 | RTL8821CU（`0bda:c820`，已真机验证）或 RTL8811CU（`0bda:c811`，单接口无蓝牙；已真机验证双向收发与驱动绑定），建议直插不经 Hub |
 | 权限 | 首次运行需要一次管理员权限，用于安装 WinUSB 驱动 |
 | 蓝牙 | 建议有。用于发 beacon 帮 iPhone 发现电脑，没有也能收但更慢 |
 
 ### 安装
 
-1. 把 `DropBridge-portable.zip` 解压到可写目录（如 `D:\DropBridge`，不要放 Program Files）。
-2. 插上网卡，双击 `DropBridge.exe`，程序只在通知区域放一个托盘图标。
-3. 首次运行会询问并通过 UAC 把网卡的 **MI_02（Wi-Fi）接口**换成 WinUSB（MI_00/MI_01 不动），日志在 `data\logs\driver-install.txt`。失败时可用托盘「安装驱动（首次使用）」重试，或按 `setup\README.txt`（仓库中 [packaging/setup/README.txt](packaging/setup/README.txt)）用 Zadig 手动绑定。
-4. 等待 40–90 秒网卡初始化，托盘提示就绪。首次成功启动会自动开启「开机自启」。
+1. 把 `DropBridge-portable.zip` 解压到可写目录（如 `D:\DropBridge`，不要放 Program Files），或直接运行单文件版 `DropBridge.exe`。
+2. 插上网卡，双击 `DropBridge.exe`（或 `DropBridgeUI.exe`），弹出主界面并驻留系统托盘（开机自启默认以 `--silent` 静默启动到托盘）。
+3. 首次使用前往 **「安装与驱动」** 页签：程序会识别专用 USB 网卡及当前联网风险，勾选确认后一键将网卡的 Wi-Fi 接口绑定为 WinUSB（8821CU 只换 **MI_02**，8811CU 为单接口设备），日志在 `data\logs\driver-install.txt`。如需恢复普通 Wi-Fi，可随时在界面或托盘点击 **「恢复原厂 Wi-Fi 驱动」**；也可按 `setup\README.txt` 用 Zadig 手动绑定。
+4. 等待约 40–90 秒网卡初始化，状态变为「运行中」即可使用。
 
-### 接收文件
+### 接收与发送文件
 
-iPhone 分享 → 隔空投送 → 选 **DropBridge**。
+- **接收（iPhone → 电脑）**：iPhone 分享 → 隔空投送 → 选 **DropBridge**（无需改 iPhone 接收范围；若手机未刷出电脑，可点击首页 **「唤醒附近 iPhone（BLE 脉冲）」**）。文件默认存到 `data\received\`，双击托盘图标即可打开。
+- **发送（电脑 → iPhone）**：iPhone 临时将隔空投送设为 **「所有人（10 分钟）」**（或配置联系人证书），把文件拖入 `DropBridgeUI.exe` 主窗口、在首页点 **「选择文件并发送…」**、右键托盘选 **「发送文件到 iPhone…」**，或在设置中开启 **「添加到右键『发送到』菜单」** 从资源管理器直接发送。
+- **通知、提示音与格式偏好**：
+  - 支持独立开关 **收到文件时播放提示音** 与 **显示右下角系统通知（图片带一键复制到剪贴板按钮）**；
+  - 支持三档接收策略：**所有人（自动接收）** / **所有人（接收前弹窗确认）** / **仅限联系人**；
+  - 支持照片与视频格式偏好：**兼容格式（JPEG / H.264）** 或 **原始格式（HEIC / HEVC）**；实况照片兼容模式下额外生成 `-still.jpg`。
+  - 在 **「联系人验证」** 页填写本机 Apple ID 邮箱/手机号（11 位手机号自动补全 `+86`）后可生成 BLE 唤醒哈希，帮助「仅限联系人」模式的 iPhone 唤醒本机；导入 Mac 导出的 `certificate.der`、`key.pk8.der`、`validation_record.cms` 与 `contact_hashes.txt` 后可启用完整双向联系人验证。
 
-- 文件默认存到 `data\received\`，双击托盘图标即可打开。
-- 收到后弹出通知，图片可一键复制到剪贴板。
-- 实况照片和 HEIC 默认额外生成 `<原名>-still.jpg`，方便直接查看。
+### 主界面与托盘菜单
 
-### 托盘菜单
-
-右键托盘图标：查看状态、打开/更改接收文件夹、打开日志、复制诊断信息、开机自启、安装驱动、修改设备名称、清理通知注册信息、蓝牙 beacon 开关、实况图单图副本开关、重新启动后端、重置链路、退出。
+- **原生主界面（`DropBridgeUI.exe`）**：四页签管理 **收发使用**、**安装与驱动**、**联系人验证**、**设置与静默自启**。
+- **系统托盘右键菜单**：打开主界面、查看状态、发送文件、打开/更改接收文件夹、打开日志、复制诊断信息、开机自启、安装/恢复驱动、修改设备名称、蓝牙 beacon 开关、实况图单图副本开关、重新启动后端、重置链路、退出。
 
 后端异常退出会自动重启，连续失败 5 次后停止，需手动「重新启动后端」。设置保存在 `data\settings.ini`。
 
 ### 数据放在哪
 
-程序数据都在程序文件夹内，不写 `%LOCALAPPDATA%`，不装服务：
+程序数据都在程序文件夹内，不写 `%LOCALAPPDATA%`（单文件版解压到同级 `app\`，数据仍在 `data\`），不装服务：
 
 ```text
 DropBridge\
-├─ DropBridge.exe   托盘程序，唯一入口
-├─ backend\         radio / bridge / awdld / awdl_netd / python / receiver / beacon.ps1
-├─ setup\           WinUSB 驱动包；手动绑定用的 Bind-WinUSB.cmd + Zadig
+├─ DropBridge.exe   托盘与守护进程入口
+├─ DropBridgeUI.exe 原生图形主界面
+├─ backend\         radio / bridge / awdld / awdl_netd / python / receiver / beacon.ps1 / airdrop_send.py
+├─ setup\           WinUSB 驱动包；Bind-WinUSB.cmd / Restore-WiFi.cmd + Zadig
 ├─ tools\           Start-Chain.ps1（控制台调试，默认 dry-run）等
-└─ data\            settings.ini、keys\（升级时保留）、received\、logs\<会话>\
+└─ data\            settings.ini、keys\、identity\、received\、logs\<会话>\
 ```
 
 写入系统的只有：HKCU 开机自启项、通知用的开始菜单快捷方式和 `dropbridge://` 协议、WinUSB 驱动包及其自签证书。
@@ -81,7 +85,7 @@ DropBridge\
 <details>
 <summary><b>手机列表里看不到 DropBridge</b></summary>
 
-确认托盘状态为「运行中」、beacon 开着，再试「重新启动后端」。正常时 `awdld.log` 里有 `peers 1`。已知传完一次后可能连不上，重启后端可恢复（Q51）。
+确认状态为「运行中」、beacon 开着，可点击主界面首页的 **「唤醒附近 iPhone（BLE 脉冲）」** 触发一次 2.5 秒蓝牙重新广播边沿，或在「联系人验证」填写自己的 Apple ID 邮箱/手机号生成 BLE 哈希前缀后重开 iPhone 分享面板。
 </details>
 
 <details>
@@ -93,21 +97,14 @@ DropBridge\
 <details>
 <summary><b>托盘提示「链路速率偏低」</b></summary>
 
-点「重置链路」。两台 iPhone 同时开隔空投送会降到约 0.1 MB/s（Q51）。
+点「重置链路」。多台 iPhone 同时开启隔空投送可能相互干扰降速（Q51）。
 </details>
 
 <details>
-<summary><b>为什么不能从电脑发文件给 iPhone / Mac</b></summary>
+<summary><b>电脑向 iPhone 发送时找不到手机或被拒绝</b></summary>
 
-隔空投送的发送方必须向接收方证明自己的身份，这一步 DropBridge 过不去：
-
-1. **前面都走通了。** 蓝牙 beacon 唤醒手机、发现手机、拿到地址和端口、建立 TCP 连接、发起 TLS 握手，这些都已在真机上验证。
-2. **卡在证书。** iPhone 收到 DropBridge 的证书后，直接用 TLS alert 断开连接（上游日志为 `Unwilling`）。手机的隔空投送已设为「所有人」，所以问题不只出在「仅联系人」上。
-3. **很可能绕不过去。** Apple 设备之间互传时，发送方会附带由 Apple 签发的身份记录（`SenderRecordData`），只有登录了 Apple ID 的 Apple 设备才拿得到，自签证书无法伪造。iPhone 拒绝的确切 alert 类型没有抓到，所以「缺这份记录」是推断，不是实测结论。
-
-因此发送方向已在 2026-11-04 确认无法实现并停止开发（Q48），DropBridge 只做接收。排查过程见 [docs/SEND_PATH.md](docs/SEND_PATH.md)。
-
-> 以上结论只在 iPhone 上实测过，**Mac 没有测试过**。macOS 对发送方证书的校验可能比 iOS 宽松，但本项目没有做过验证，也不提供这个功能。
+1. 确认 iPhone 屏幕点亮且隔空投送已临时设为 **「所有人（10 分钟）」**（或已配置匹配的 Apple 身份证书）；
+2. 若点击发送后卡在连接，确认设备发现列表里能看到目标 iPhone 后重试。
 </details>
 
 <details>
@@ -121,7 +118,7 @@ DropBridge\
 ### 工作原理
 
 ```text
-iPhone ──AWDL──▶ RTL8821CU（MI_02 = WinUSB）
+iPhone ──AWDL──▶ RTL8821CU（MI_02 = WinUSB）/ RTL8811CU（WinUSB）
   └▶ airbridge_radio.exe    devourer 用户态驱动（libusb），TCP 49876
   └▶ radio_pipe_bridge.exe  命名管道 ↔ TCP
   └▶ awdld.exe              OWL 的 AWDL 控制面（打补丁，走 IPC 后端）
@@ -136,7 +133,7 @@ iPhone ──AWDL──▶ RTL8821CU（MI_02 = WinUSB）
 ### 仓库结构
 
 ```text
-src/         supervisor（托盘）、sfx、radio_usb、awdl_netd、beacon
+src/         supervisor（托盘）、ui_rust（Rust 原生主界面）、sfx、radio_usb、awdl_netd、beacon
 patches/     对 devourer、WinAWDL、OWL 的补丁
 tools/       构建、打包、诊断脚本和测试
 packaging/   包内 README、WinUSB 驱动包、手动绑定工具
@@ -163,6 +160,7 @@ cmake -S src\awdl_netd -B build\awdl_netd -A x64
 cmake --build build\awdl_netd --config Release
 ctest --test-dir build\awdl_netd -C Release
 .\tools\Build-Supervisor.ps1 -Test
+.\tools\Build-UiRust.ps1
 ```
 
 **4. 打包。**
@@ -191,21 +189,21 @@ dist\DropBridge\DropBridge.exe --check     # 应 exit 0
 
 ## 状态与限制
 
-源码实现、本机编译、本机硬件、真实文件传输四层分开记录。当前 HEAD 含 Q68–Q70 修复，**尚未测试**，与最后一次测过的包（Q50 起）不同。
+源码实现、本机编译、本机硬件、真实文件传输四层分开记录。当前 HEAD 为 **Q78**（包含 Q71–Q78：RTL8811CU 支持、双向收发、BLE 唤醒脉冲、数据面防饿死、Rust 原生主界面、联系人验证与提示音/通知开关）。
 
 | 实测（真实文件字节 / 墙钟时间） | 结果 | 出处 |
 | --- | --- | --- |
 | 1,207,111 B 图片 | 1.23 s（0.98 MB/s） | Q45 |
 | 29,456,959 B 视频 | 26.84 s（1.10 MB/s） | Q46 / Q54 |
 | 两台 iPhone 同时在线 | 0.08–0.12 MB/s | Q51 |
+| RTL8811CU 双向发现与收发 | 已真机验证通过 | Q77 |
 
-**未解决**
+**待解决 / 待验证**
 
-- 只能接收，发送已确认无法实现（Q48）
-- 首次传输后发现丢失、多机降速（Q51）
-- 24 小时常驻测试未完成（Q7）
-- `/Discover` 分块解析过严（Q43）
-- 驱动「未绑定 → 已绑定」未真机验证（Q53）
+- 多台 iPhone 同时在线时的并发降速与抗干扰（Q51，尚未复测）
+- 24 小时常驻稳定性与内存/句柄泄漏测试未完成（Q7）
+- `/Discover` 分块解析过严（Q43，未修改）
+- 一键「恢复原厂 Wi-Fi 驱动」实际回退尚未真机点击演练（Q72，离线单测通过）
 
 **对外分发前还缺**：Realtek 固件再分发授权、代码签名、干净机器验收（Q13）、WinUSB 回滚演练、包内第三方许可证文本补全。详见 [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)。
 

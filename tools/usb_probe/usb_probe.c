@@ -28,12 +28,17 @@ static const char *err_name(int code) {
 }
 
 int main(int argc, char **argv) {
-    uint16_t vid = 0x0bda, pid = 0xc820;
+    uint16_t vid = 0x0bda;
+    uint16_t pids[2] = {0xc820, 0xc811};
+    size_t pid_count = 2;
     int do_read = 0;
     int read_width = 0;
     uint16_t read_reg = 0;
     if (argc > 1) vid = (uint16_t)strtoul(argv[1], NULL, 16);
-    if (argc > 2) pid = (uint16_t)strtoul(argv[2], NULL, 16);
+    if (argc > 2) {
+        pids[0] = (uint16_t)strtoul(argv[2], NULL, 16);
+        pid_count = 1;
+    }
     if (argc > 4 && strcmp(argv[3], "--read8") == 0) {
         do_read = 1;
         read_width = 1;
@@ -45,7 +50,11 @@ int main(int argc, char **argv) {
     }
 
     printf("libusb %s\n", libusb_get_version()->describe);
-    printf("target %04x:%04x\n", vid, pid);
+    if (pid_count == 1) {
+        printf("target %04x:%04x\n", vid, pids[0]);
+    } else {
+        printf("target %04x:{c820,c811}\n", vid);
+    }
 
     libusb_context *ctx = NULL;
     int rc = libusb_init(&ctx);
@@ -63,12 +72,16 @@ int main(int argc, char **argv) {
     }
 
     libusb_device *target = NULL;
-    for (ssize_t i = 0; i < count; i++) {
-        struct libusb_device_descriptor desc;
-        if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
-        if (desc.idVendor == vid && desc.idProduct == pid) {
-            target = list[i];
-            break;
+    uint16_t matched_pid = 0;
+    for (size_t p = 0; p < pid_count && !target; p++) {
+        for (ssize_t i = 0; i < count; i++) {
+            struct libusb_device_descriptor desc;
+            if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
+            if (desc.idVendor == vid && desc.idProduct == pids[p]) {
+                target = list[i];
+                matched_pid = pids[p];
+                break;
+            }
         }
     }
 
@@ -78,6 +91,7 @@ int main(int argc, char **argv) {
         libusb_exit(ctx);
         return 2;
     }
+    printf("matched %04x:%04x\n", vid, matched_pid);
 
     printf("bus %u address %u speed %d\n",
            (unsigned)libusb_get_bus_number(target),
@@ -95,7 +109,7 @@ int main(int argc, char **argv) {
     rc = libusb_open(target, &handle);
     if (rc != 0) {
         printf("open failed: %s\n", err_name(rc));
-        printf("hint: MI_02 is still bound to a vendor driver; follow "
+        printf("hint: the Wi-Fi interface is still bound to a vendor driver; follow "
                "docs/BINDING_RUNBOOK.md first.\n");
         libusb_free_device_list(list, 1);
         libusb_exit(ctx);

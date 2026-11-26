@@ -82,5 +82,13 @@ if ($Test) {
     if ($LASTEXITCODE -ne 0) { throw "settings test compile failed: $LASTEXITCODE" }
     & $settingsTest
     if ($LASTEXITCODE -ne 0) { throw "settings test failed: $LASTEXITCODE" }
+
+    $radioBindingTest = Join-Path $outDir 'radio_binding_test.exe'
+    & $csc /nologo /target:exe /main:RadioBindingTest "/out:$radioBindingTest" @wpfArgument `
+        /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll $source `
+        (Join-Path $root 'src\supervisor\radio_binding_test.cs')
+    if ($LASTEXITCODE -ne 0) { throw "radio binding test compile failed: $LASTEXITCODE" }
+    & $radioBindingTest
+    if ($LASTEXITCODE -ne 0) { throw "radio binding test failed: $LASTEXITCODE" }
 }
 

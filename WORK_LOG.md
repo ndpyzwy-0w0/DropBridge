@@ -1,5 +1,66 @@
 # 工作记录 / 下一位 Agent 交接
 
+## 2026-11-27：Q78 接收提示音开关与右下角通知开关
+
+- **功能实现**：
+  - `src/supervisor/Program.cs`：`Settings` 新增 `NotifySound` 与 `NotifyToast`（默认均开启），持久化至 `settings.ini` 并在 `data\status.json` 中暴露 `notifySound` / `notifyToast`。`ShowReceived` 在非实况图伴生视频时按开关播放 Windows 通知音（`Windows Notify Messaging.wav` 等回退 `SystemSounds.Asterisk`）并独立控制右下角 Toast/气泡通知；`HandleUiCommand` 新增 `notify_sound_on/off` 与 `notify_toast_on/off`。
+  - `src/ui_rust/src/main.rs`：「设置与静默自启」页面新增「收到文件时播放提示音」与「收到文件时显示右下角系统通知（含图片复制按钮）」两个复选框。
+- **验证**：`Build-Supervisor.ps1 -Test`、`Build-UiRust.ps1` 与便携版/无头版/单文件 `dist\DropBridge.exe`（23.3 MB）重打包全部通过；同时用户确认 Q77 真机双向发现与传输已成功。
+
+## 2026-11-26：Q77 参考 NekoDrop 优化数据面调度、BLE 唤醒、5G 信道探测与接收策略
+
+- **数据面防饿死与高吞吐（`patches/awdl-ipc-host.patch` / `upstream/winawdl`）**：
+  - `awdl/win/ev_win.c`：修复 `WaitForMultipleObjects` 只回调首个就绪句柄导致无线 RX 饿死 `host_fd` 管道的问题，改为唤醒后非阻塞轮询其余所有就绪句柄。
+  - `awdl/win/io_win.c`：`pcap_dispatch` 改为单次最多批量处理 32 帧，降低内核等待与定时器开销。
+  - `awdl/win/radio_client.h/.c`：`RADIO_CLIENT_MAX_FRAME` 从 4096 提至 12800 容纳大号 RX A-MSDU，并增加 64 KB 管道预读缓冲区。
+  - `tools/Build-Awdl.ps1` / `tools/Build-Radio.ps1`：自动探测本机 CMake 4.1.2 与 MinGW `-lwinpthread`，修复无参一键构建。
+- **BLE 唤醒与 5 GHz 信道自适应**：
+  - `src/beacon/airdrop-beacon.ps1`：支持 `DROPBRIDGE_BLE_HASHES`（最多 4 个 2 字节 SHA-256 前缀，否则生成非零随机字节）、`DROPBRIDGE_BEACON_PULSE`（2.5s 停播重启制造唤醒边沿）与 3 次 `Aborted` 自动重试。
+  - `src/radio_usb/main.cpp`：在 `on_rx` 解析对端 AWDL Action 帧 `TLV 18`，在 `radio.log` 记录 `peer_5g=44/149`。
+  - `upstream/winawdl/airdrop/receiver.py`：支持 `8771..8779` 端口回退并同步更新 mDNS SRV；传输结束后自动触发一次 BLE 脉冲。
+- **联系人验证、弹窗确认与媒体格式**：
+  - `tools/apple_identity.py`、`src/supervisor/Program.cs`、`src/ui_rust/src/main.rs`：支持填写本机 Apple ID 邮箱/手机号（`+86` 规范化生成 BLE 哈希前缀）、三档接收策略（自动接收 / 弹窗询问确认 / 仅限联系人）与媒体格式偏好（兼容 JPEG/H.264 / 原始 HEIC/HEVC），首页新增「唤醒附近 iPhone（BLE 脉冲）」按钮。
+- **验证**：`Build-Radio.ps1`（`peer_telemetry`、`channel_completion` 2/2 通过）、`Build-Awdl.ps1`、`Build-Supervisor.ps1 -Test`、`Build-UiRust.ps1`、`test_airdrop_send.py`、`apple_identity` 自检、`airdrop-beacon.ps1 -DryRun` 全部通过；便携版/无头版/单文件 `dist\DropBridge.exe`（23.3 MB）重打包完成。
+
+## 2026-11-26：Q76 双向 mDNS/发送窗口修复与联系人验证功能
+
+- **问题修复**：
+  - `src/awdl_netd/lwip_proxy.cpp`：分离 `g_announcer` 与 `g_querier`，修复 `airdrop_send.py` 与 `receiver.py` 共用 `15353` 时手机查询被转走的问题；出站套接字开启 `TCP_NODELAY`。
+  - `src/awdl_netd/lwipopts.h`：`TCP_SND_BUF` 从 32 KB 提至 48 KB，`TCP_SND_QUEUELEN=128`、`MEMP_NUM_TCP_SEG=256`。
+- **联系人验证（Contacts Only）**：
+  - 新增 `tools/apple_identity.py`，支持导入 Mac 导出的 `certificate.der` / `key.pk8.der` / `validation_record.cms` 与 `contact_hashes.txt`；接入 `upstream/winawdl/airdrop/receiver.py`（刷新 `patches/awdl-ipc-host.patch`）与 `tools/airdrop_send.py`。
+  - `src/supervisor/Program.cs` 与 `src/ui_rust/src/main.rs` 新增「联系人验证」页签（导入证书、切换所有人/仅限联系人模式、添加/清空信任联系人手机号与邮箱）。
+- **验证**：`Build-Supervisor.ps1 -Test`（含联系人哈希单测）、`Build-UiRust.ps1`、`test_airdrop_send.py` 通过；`awdl_netd.exe` 编译通过（仅因用户后台运行实机链路占用 49877/8771，CTest 1–2 通过、3–7 端口冲突）；重新打包完成。
+
+## 2026-11-26：Q75 Rust 原生前端页面（DropBridgeUI.exe）与静默开机自启
+
+- **Rust 前端（`src/ui_rust/`）**：使用 `eframe` + `rfd` 编写 `DropBridgeUI.exe`（4.2 MB，无外部运行时依赖，自动加载微软雅黑），提供「收发使用」（状态、重启/重置、打开接收目录、选择或拖拽文件发送）、「安装与驱动」（网卡识别、高危断网提示、一键安装/恢复）、「设置与静默自启」（开机静默自启、右键发送到、改名、改目录、Beacon、实况图副本）。
+- **静默自启与联动（`src/supervisor/Program.cs`）**：`AutostartValue()` 改为带 `--silent` 参数；`--silent` 启动时不弹出主页面和启动气泡；托盘实时写 `data\status.json` 并通过 `dropbridge://ui?cmd=...` 响应前端控制；正常双击 `DropBridge.exe` 或双击托盘自动打开 `DropBridgeUI.exe`。
+- **验证**：`Build-Supervisor.ps1 -Test` 与 `Build-UiRust.ps1` 通过；重打便携版、headless 与单文件包，`--check` exit 0。
+
+## 2026-11-26：Q73/Q74 双向传输（PC → iPhone 发送匿名 TLS 与托盘发送窗口）
+
+- **根因与协议修复（Q73）**：对照 AirDrop 协议确认 iPhone 在「所有人（10 分钟）」模式下接受**无客户端证书**的匿名 TLS 连接，而原 `tools/airdrop_send.py` 复用 `sender.client_context()` 主动出示自签证书会触发证书拒绝。改为 `anonymous_client_context()`，并新增打包路径探测、`--json` 交互会话模式与端口刷新重试。
+- **前端与系统入口（Q74）**：`Supervisor.AllowSend` 默认开启（8772 出站代理）；`src/supervisor/Program.cs` 新增 `SendFilesDialog`（拖拽文件、附近设备实时列表、「仅限联系人」提示条、发送进度与取消）、托盘「发送文件到 iPhone…」、`--send` / `dropbridge://send` 命名管道唤醒、以及 `%APPDATA%\Microsoft\Windows\SendTo\DropBridge.lnk` 开关；`Package-Distributable.ps1` 与 `Package-Headless.ps1` 同步复制 `airdrop_send.py`。
+- **验证**：`tools/test_airdrop_send.py`（模拟 15353 mDNS + 8772 `CONNECT` 代理 + 拒绝客户端证书的模拟 iPhone HTTPS 服务端）CLI 与 `--json` 全部通过且文件 SHA-256 一致；`Build-Supervisor.ps1 -Test`（含 `BuildSendUri`/`FilesFromSendUri`/`SendHelpers` 新单测）全部通过。尚未进行真机无线发送实测（待硬件授权）。
+
+## 2026-11-26：Q72 Issue #11 安装前网卡识别确认弹窗与一键回退
+
+- **改动**：
+  - `src/supervisor/Program.cs`：新增 `RadioBinding.Inspect()`（识别目标型号、实例 ID、当前驱动服务及是否正在联网/有无其他备用网络）、`DriverSetupDialog` 前端确认弹窗（含高危断网警示、注意事项勾选解锁「确认安装」）、`RadioBinding.Restore()`、`--restore-driver`、托盘菜单「恢复原厂 Wi-Fi 驱动…」，以及安装失败时主动提示尝试恢复原状。
+  - `packaging/setup/Restore-WiFi.cmd` / `Restore-WiFi.ps1`：新增独立一键回退脚本（卸载 `airbridge-winusb.inf`、`pnputil /remove-device` + `/scan-devices`），并同步更新 `packaging/setup/README.txt` 与 `docs/BINDING_RUNBOOK.md`。
+  - `src/supervisor/radio_binding_test.cs`：补充 `AssessNetworkRisk`、`IsTargetAdapterDescription`、`ParsePublishedInfNames` 离线单测。
+- **验证**：`Build-Supervisor.ps1 -Test` 全部通过，`Restore-WiFi.ps1` PowerShell 语法解析通过。未执行真机换驱动或回退（待授权）。
+
+## 2026-11-26：Q71 适配 RTL8811CU（0bda:c811）源码与驱动包
+
+- **本机硬件基线（只读）**：`USB\VID_0BDA&PID_C811\123456`，非复合设备（无 `MI_xx`，无蓝牙），当前驱动 `RtlWlanu` / `oem302.inf`（1030.52.1216.2025），直插 `USB\ROOT_HUB30`；ZeroCD `1a2b` 未出现；主机自带 `Intel(R) Wireless Bluetooth(R)` 与 `Intel(R) Wi-Fi 7 BE200`（主网络不受换驱动影响）。
+- **改动**：
+  - `src/radio_usb/main.cpp`、`tools/usb_probe/usb_probe.c`：未指定 `AIRBRIDGE_PID` / 命令行 PID 时按 `{0xc820, 0xc811}` 依次打开；无需改动 `upstream/devourer`（`find_wifi_interface` 已按端点动态选接口，且上游原就在 8811CU 上实测）。
+  - `src/supervisor/Program.cs`：`RadioBinding` 改为匹配表（`PID_C820&MI_02\` 与 `PID_C811\`），`StartAll` 通过 `AIRBRIDGE_PID` 固定托盘检测到的 PID；新增 `src/supervisor/radio_binding_test.cs` 并在 `tools/Build-Supervisor.ps1 -Test` 运行。
+  - `packaging/driver/airbridge-winusb.inf` 新增 `USB\VID_0BDA&PID_C811` 并用 `tools/Build-DriverPackage.ps1` 重新生成签名 `.cat`/`.cer`；同步更新 `packaging/setup/{Check-Binding.ps1,Bind-WinUSB.cmd,README.txt,licenses/ZADIG.txt}`、`packaging/README.txt`、`tools/Check-Binding.ps1`、`README.md`、`docs/BINDING_RUNBOOK.md`。
+- **验证**：`Build-Supervisor.ps1 -Test` 四项离线测试通过（含 `PASS radio_binding`）；`packaging\setup\Check-Binding.ps1` 与 `tools\Check-Binding.ps1` 均识别 `RTL8811CU` 且正确返回 exit 1（未绑 WinUSB）。尚未换驱动，未运行硬件。
+
 ## 2026-11-10：新增发布前核对清单
 
 - 新增 `docs/RELEASE_CHECKLIST.md`，七部分：Windows 编译与测试、包内容、真机功能（含 Q68–Q70 改动的逐项验证）、干净机器从零安装与卸载回滚、许可证与合规、版本可复现与文档一致、发布动作。全部条目未完成。

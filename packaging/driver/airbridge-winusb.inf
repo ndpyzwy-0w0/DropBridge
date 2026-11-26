@@ -1,9 +1,10 @@
-; DropBridge: bind the Wi-Fi interface of the RTL8821CU (0bda:c820, MI_02) to
-; the in-box WinUSB driver, so libusb can open it without replacing anything
-; else on the device. Built and signed by tools\Build-DriverPackage.ps1.
+; DropBridge: bind the Wi-Fi interface of supported Realtek adapters
+; (RTL8821CU 0bda:c820 MI_02, RTL8811CU 0bda:c811) to the in-box WinUSB
+; driver, so libusb can open it without replacing anything else on the device.
+; Built and signed by tools\Build-DriverPackage.ps1.
 ;
-; Deliberately narrow: one hardware id, one interface. MI_00 (Bluetooth) and the
-; composite parent are not mentioned, so they keep their drivers.
+; Deliberately narrow: for RTL8821CU, MI_00 (Bluetooth) and the composite
+; parent are not mentioned, so they keep their drivers.
 
 [Version]
 Signature = "$Windows NT$"
@@ -18,7 +19,8 @@ PnpLockdown = 1
 %PROVIDER% = DeviceList,NTamd64
 
 [DeviceList.NTamd64]
-%DEVICE% = Install, USB\VID_0BDA&PID_C820&MI_02
+%DEVICE_8821% = Install, USB\VID_0BDA&PID_C820&MI_02
+%DEVICE_8811% = Install, USB\VID_0BDA&PID_C811
 
 [Install.NTamd64]
 Include = winusb.inf
@@ -35,5 +37,6 @@ AddReg = AddInterfaceGuid
 HKR,,DeviceInterfaceGUIDs,0x00010000,"{A5DCBF10-6530-11D2-901F-00C04FB951ED}"
 
 [Strings]
-PROVIDER = "DropBridge"
-DEVICE   = "DropBridge AWDL radio (RTL8821CU Wi-Fi interface)"
+PROVIDER    = "DropBridge"
+DEVICE_8821 = "DropBridge AWDL radio (RTL8821CU Wi-Fi interface)"
+DEVICE_8811 = "DropBridge AWDL radio (RTL8811CU Wi-Fi interface)"

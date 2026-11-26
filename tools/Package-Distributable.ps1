@@ -59,6 +59,10 @@ foreach ($dir in 'backend', 'backend\airdrop', 'backend\python', 'tools', 'licen
 }
 
 Copy-Item $supervisor (Join-Path $stage 'DropBridge.exe') -Force
+$uiRust = Join-Path $root 'build\ui_rust\DropBridgeUI.exe'
+if (Test-Path $uiRust) {
+    Copy-Item $uiRust (Join-Path $stage 'DropBridgeUI.exe') -Force
+}
 
 # Q59e: Windows resolves the toast header icon from the AppUserModelId registration,
 # whose IconUri has to point at an image file; the exe path is not enough.
@@ -80,6 +84,8 @@ if (Test-Path $pth) {
 }
 
 Copy-Item (Join-Path $airdrop '*.py') (Join-Path $stage 'backend\airdrop') -Force
+Copy-Item (Join-Path $root 'tools\airdrop_send.py') (Join-Path $stage 'backend\airdrop\airdrop_send.py') -Force
+Copy-Item (Join-Path $root 'tools\apple_identity.py') (Join-Path $stage 'backend\airdrop\apple_identity.py') -Force
 
 # Bluetooth beacon: keeps iPhone AWDL awake so the tray stays discoverable even
 # when the phone's share sheet is closed (MIT, upstream winawdl).

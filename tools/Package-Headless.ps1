@@ -49,6 +49,10 @@ foreach ($dir in 'backend\airdrop', 'tools', 'licenses', 'setup') {
 foreach ($file in @($radio, $bridge, $netd, $awdld, $libusb, $supervisor)) {
     Copy-Item $file (Join-Path $stage 'backend') -Force
 }
+$uiRust = Join-Path $root 'build\ui_rust\DropBridgeUI.exe'
+if (Test-Path $uiRust) {
+    Copy-Item $uiRust (Join-Path $stage 'DropBridgeUI.exe') -Force
+}
 
 # Q59e: the toast icon is resolved from this file (see AppIdentity.IconFile),
 # so the single-file payload has to carry it next to the supervisor.
@@ -67,6 +71,8 @@ if (Test-Path $pth) {
 }
 
 Copy-Item (Join-Path $airdrop '*.py') (Join-Path $stage 'backend\airdrop') -Force
+Copy-Item (Join-Path $root 'tools\airdrop_send.py') (Join-Path $stage 'backend\airdrop\airdrop_send.py') -Force
+Copy-Item (Join-Path $root 'tools\apple_identity.py') (Join-Path $stage 'backend\airdrop\apple_identity.py') -Force
 
 # Same extras as Package-Distributable.ps1. The self-extractor passes
 # --root app\<build>, so the tray looks for <root>\backend\beacon.ps1 and

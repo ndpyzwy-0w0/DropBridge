@@ -261,10 +261,43 @@ internal sealed class Child
         Interlocked.Exchange(ref _lastOutputTicks, DateTime.UtcNow.Ticks);
         _log.Write(Name, line);
         if (_lineSeen != null) _lineSeen(line);
+        if (Name == "receiver" && line.StartsWith("ASK_CONFIRM|", StringComparison.Ordinal))
+        {
+            HandleAskConfirmLine(line);
+        }
         if (_needle != null && line.IndexOf(_needle, StringComparison.Ordinal) >= 0)
         {
             Ready.Set();
         }
+    }
+
+    private void HandleAskConfirmLine(string line)
+    {
+        string[] parts = line.Split(new[] { '|' }, 5);
+        if (parts.Length < 5) return;
+        string reqId = parts[1];
+        string sender = parts[2];
+        string model = parts[3];
+        string summary = parts[4];
+        string askDir = Path.GetFullPath(Path.Combine(_log.DirectoryPath, "..", "..", "ask"));
+        var t = new Thread(delegate()
+        {
+            string title = "DropBridge 隔空投送请求";
+            string msg = "来自「" + sender + (string.IsNullOrEmpty(model) ? "" : " (" + model + ")") +
+                         "」的投送：\n" + summary + "\n\n是否接收？";
+            DialogResult res = MessageBox.Show(msg, title, MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question, MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);
+            try
+            {
+                Directory.CreateDirectory(askDir);
+                File.WriteAllText(Path.Combine(askDir, reqId + ".ans"),
+                    res == DialogResult.Yes ? "accept" : "decline", Encoding.ASCII);
+            }
+            catch (Exception) { }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.IsBackground = true;
+        t.Start();
     }
 
     /// <summary>
@@ -445,6 +478,7 @@ internal sealed class Supervisor
     // Per-user state (markers, logs) belongs here, not under Root: in the
     // single-exe layout Root is app\<build>, which changes on every upgrade.
     public string DataDirectory { get { return _data; } }
+    public string AppleIdentityDirectory { get { return Path.Combine(_data, "apple-identity"); } }
 
     private Child[] Snapshot()
     {
@@ -646,8 +680,14 @@ internal sealed class Supervisor
     private string BridgePath() { return Path.Combine(_backend, "radio_pipe_bridge.exe"); }
     private string NetdPath() { return Path.Combine(_backend, "awdl_netd.exe"); }
     private string AwdldPath() { return Path.Combine(_backend, "awdld.exe"); }
-    private string PythonPath() { return Path.Combine(_backend, "python", "python.exe"); }
-    private string ReceiverPath() { return Path.Combine(_backend, "airdrop", "receiver.py"); }
+    internal string PythonPath() { return Path.Combine(_backend, "python", "python.exe"); }
+    internal string ReceiverPath() { return Path.Combine(_backend, "airdrop", "receiver.py"); }
+    internal string SenderPath()
+    {
+        string packaged = Path.Combine(_backend, "airdrop", "airdrop_send.py");
+        if (File.Exists(packaged)) return packaged;
+        return Path.GetFullPath(Path.Combine(_root, "tools", "airdrop_send.py"));
+    }
     private string AddressFile() { return Path.Combine(_data, "awdl_netd.addr"); }
 
     public List<string> Validate()
@@ -728,7 +768,15 @@ internal sealed class Supervisor
             " --mdns-address-file " + QuoteArgument(AddressFile()) +
             " --outdir " + QuoteArgument(ReceivedDirectory) +
             " --keys " + QuoteArgument(Path.Combine(_data, "keys")) + " --trace",
-            new Dictionary<string, string> { { "PYTHONUNBUFFERED", "1" } },
+            new Dictionary<string, string>
+            {
+                { "PYTHONUNBUFFERED", "1" },
+                { "DROPBRIDGE_APPLE_IDENTITY", AppleIdentityDirectory },
+                { "DROPBRIDGE_RECEIVE_MODE", Prefs.ReceiveMode },
+                { "DROPBRIDGE_MEDIA_FORMAT", Prefs.MediaFormat },
+                { "DROPBRIDGE_BEACON_PULSE", Path.Combine(_data, "beacon.pulse") },
+                { "DROPBRIDGE_ASK_DIR", Path.Combine(_data, "ask") },
+            },
             _root, "receiving as", _log);
     }
 
@@ -935,6 +983,8 @@ internal sealed class Supervisor
                 // even when that death is a force kill (Q55).
                 { "AIRBRIDGE_PARENT_PID",
                   System.Diagnostics.Process.GetCurrentProcess().Id.ToString() },
+                // Pin the radio to whichever supported adapter is present (Q71).
+                { "AIRBRIDGE_PID", RadioBinding.DetectedPidHex() },
             },
             _root, "listening on 127.0.0.1:49876", _log, OnChildLine);
         var bridge = new Child("bridge", BridgePath(), "",
@@ -1063,12 +1113,200 @@ internal sealed class Supervisor
     }
 }
 
+internal sealed class RadioTarget
+{
+    public readonly string Name;
+    public readonly string PidHex;
+    public readonly string Prefix;
+    public readonly string WqlLike;
+    public readonly string InterfaceLabel;
+
+    public RadioTarget(string name, string pidHex, string prefix, string wqlLike, string interfaceLabel)
+    {
+        Name = name;
+        PidHex = pidHex;
+        Prefix = prefix;
+        WqlLike = wqlLike;
+        InterfaceLabel = interfaceLabel;
+    }
+
+    public bool MatchesDeviceId(string deviceId)
+    {
+        return !string.IsNullOrEmpty(deviceId) &&
+               deviceId.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+internal sealed class RadioInspection
+{
+    public RadioTarget Target;
+    public string DeviceId;
+    public string FriendlyName;
+    public string Service;
+    public string ActiveAdapterName;
+    public bool TargetIsUp;
+    public bool HasOtherUpNetwork;
+
+    public bool WouldLoseAllNetwork
+    {
+        get { return RadioBinding.AssessNetworkRisk(TargetIsUp, HasOtherUpNetwork); }
+    }
+}
+
+internal sealed class DriverSetupDialog : Form
+{
+    private readonly CheckBox _ackBox;
+    private readonly Button _installButton;
+
+    public DriverSetupDialog(RadioInspection info)
+    {
+        Text = "DropBridge — 驱动安装前确认";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        AutoScaleMode = AutoScaleMode.Font;
+        ClientSize = new Size(520, 390);
+
+        var title = new Label
+        {
+            Text = "即将把以下专用网卡的 Wi-Fi 接口绑定到 WinUSB 驱动：",
+            Font = new Font(Font.FontFamily, 9.5f, FontStyle.Bold),
+            Location = new Point(18, 16),
+            Size = new Size(484, 24),
+        };
+
+        string svcDisplay = string.IsNullOrEmpty(info.Service) ? "无" : info.Service;
+        string netLine = info.TargetIsUp
+            ? ("当前联网状态：正在连接网络 (" + (info.ActiveAdapterName ?? "已连接") + ")")
+            : "当前联网状态：未连接（不会影响电脑当前正在使用的网络）";
+        string detailsText =
+            "识别型号：" + info.Target.Name + " (" + info.Target.PidHex + ", 接口: " + info.Target.InterfaceLabel + ")\r\n" +
+            "设备名称：" + (info.FriendlyName ?? info.Target.Name) + "\r\n" +
+            "实例 ID ：" + (info.DeviceId ?? "") + "\r\n" +
+            "当前驱动：" + svcDisplay + "\r\n" +
+            netLine;
+
+        var details = new TextBox
+        {
+            Text = detailsText,
+            ReadOnly = true,
+            Multiline = true,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = SystemColors.Window,
+            Location = new Point(18, 46),
+            Size = new Size(484, 96),
+        };
+
+        string riskText;
+        Color riskBack;
+        Color riskFore;
+        if (info.WouldLoseAllNetwork)
+        {
+            riskText = "⚠ 高危提示：这张网卡当前正在联网，且未检测到其他已连接网络！\r\n" +
+                       "绑定 WinUSB 后此网卡将无法连接普通 Wi-Fi，继续操作会导致电脑立即断网。";
+            riskBack = Color.FromArgb(254, 226, 226);
+            riskFore = Color.FromArgb(153, 27, 27);
+        }
+        else if (info.TargetIsUp)
+        {
+            riskText = "注意：这张网卡当前处于已连接状态；绑定 WinUSB 后将专用于 DropBridge，\r\n" +
+                       "电脑将改用其他已连接网络上网。";
+            riskBack = Color.FromArgb(254, 243, 199);
+            riskFore = Color.FromArgb(146, 64, 14);
+        }
+        else
+        {
+            riskText = "✓ 安全提示：该网卡当前未用于上网，且仅接管上述专用网卡，\r\n" +
+                       "不会改动电脑原有的 Intel / 板载 Wi-Fi 或有线网卡。";
+            riskBack = Color.FromArgb(220, 252, 231);
+            riskFore = Color.FromArgb(22, 101, 52);
+        }
+
+        var riskBox = new Label
+        {
+            Text = riskText,
+            BackColor = riskBack,
+            ForeColor = riskFore,
+            Padding = new Padding(8),
+            Location = new Point(18, 154),
+            Size = new Size(484, 54),
+        };
+
+        var notes = new Label
+        {
+            Text = "注意事项与可逆保障：\r\n" +
+                   "1. 绑定后该网卡将专用于 5 GHz AWDL 隔空投送，无法同时连接普通 Wi-Fi。\r\n" +
+                   "2. 建议直插机箱后置 USB 口；安装过程会弹出一次 Windows 管理员确认。\r\n" +
+                   "3. 随时可逆：可通过托盘菜单「恢复原厂 Wi-Fi 驱动…」或 setup\\Restore-WiFi.cmd 一键恢复。",
+            Location = new Point(18, 218),
+            Size = new Size(484, 72),
+        };
+
+        _ackBox = new CheckBox
+        {
+            Text = "我已知晓以上注意事项，确认仅对上述网卡安装 WinUSB 驱动",
+            Location = new Point(18, 296),
+            Size = new Size(484, 26),
+        };
+
+        _installButton = new Button
+        {
+            Text = "确认安装",
+            DialogResult = DialogResult.OK,
+            Enabled = false,
+            Location = new Point(312, 338),
+            Size = new Size(92, 30),
+        };
+
+        var cancelButton = new Button
+        {
+            Text = "取消",
+            DialogResult = DialogResult.Cancel,
+            Location = new Point(410, 338),
+            Size = new Size(92, 30),
+        };
+
+        _ackBox.CheckedChanged += delegate { _installButton.Enabled = _ackBox.Checked; };
+
+        Controls.Add(title);
+        Controls.Add(details);
+        Controls.Add(riskBox);
+        Controls.Add(notes);
+        Controls.Add(_ackBox);
+        Controls.Add(_installButton);
+        Controls.Add(cancelButton);
+
+        CancelButton = cancelButton;
+        if (!info.WouldLoseAllNetwork) AcceptButton = _installButton;
+        else ActiveControl = cancelButton;
+    }
+}
+
 internal static class RadioBinding
 {
-    // One interface only: the Wi-Fi half of the RTL8821CU. MI_00 (Bluetooth) and
-    // the composite parent are never named here. WQL treats a backslash as an
-    // escape, so the runtime string needs doubled backslashes.
-    private const string Pattern = "USB\\\\VID_0BDA&PID_C820&MI_02";
+    // Supported adapters:
+    // - RTL8821CU (0bda:c820): composite device; only MI_02 (Wi-Fi) is bound,
+    //   never MI_00 (Bluetooth) or the composite parent.
+    // - RTL8811CU (0bda:c811): single-interface Wi-Fi adapter (no MI_xx); the
+    //   trailing backslash keeps future &MI_xx variants from matching here.
+    internal static readonly RadioTarget[] Targets =
+    {
+        new RadioTarget("RTL8821CU", "0xc820", @"USB\VID_0BDA&PID_C820&MI_02\",
+            "USB\\\\VID_0BDA&PID_C820&MI_02\\\\%", "MI_02"),
+        new RadioTarget("RTL8811CU", "0xc811", @"USB\VID_0BDA&PID_C811\",
+            "USB\\\\VID_0BDA&PID_C811\\\\%", "Wi-Fi"),
+    };
+
+    internal static RadioTarget MatchTarget(string deviceId)
+    {
+        if (string.IsNullOrEmpty(deviceId)) return null;
+        foreach (RadioTarget target in Targets)
+        {
+            if (target.MatchesDeviceId(deviceId)) return target;
+        }
+        return null;
+    }
 
     internal static bool IsAdmin()
     {
@@ -1084,18 +1322,46 @@ internal static class RadioBinding
         }
     }
 
-    /// <summary>Service of the MI_02 interface, "" when present without one, null when absent.</summary>
     internal static string Service()
     {
+        RadioTarget unused;
+        return Service(out unused);
+    }
+
+    /// <summary>Service of the matched Wi-Fi target, "" when present without one, null when absent.</summary>
+    internal static string Service(out RadioTarget matched)
+    {
+        matched = null;
         try
         {
-            using (var searcher = new ManagementObjectSearcher(
-                       "SELECT DeviceID, Service FROM Win32_PnPEntity WHERE DeviceID LIKE '" + Pattern + "%'"))
+            var clauses = new List<string>();
+            foreach (RadioTarget target in Targets)
             {
+                clauses.Add("DeviceID LIKE '" + target.WqlLike + "'");
+            }
+            string query = "SELECT DeviceID, Service FROM Win32_PnPEntity WHERE " +
+                           string.Join(" OR ", clauses);
+            using (var searcher = new ManagementObjectSearcher(query))
+            {
+                var found = new List<KeyValuePair<RadioTarget, string>>();
                 foreach (ManagementObject item in searcher.Get())
                 {
+                    string deviceId = item["DeviceID"] as string;
+                    RadioTarget target = MatchTarget(deviceId);
+                    if (target == null) continue;
                     string service = item["Service"] as string;
-                    return service ?? string.Empty;
+                    found.Add(new KeyValuePair<RadioTarget, string>(target, service ?? string.Empty));
+                }
+                foreach (RadioTarget preferred in Targets)
+                {
+                    foreach (var entry in found)
+                    {
+                        if (entry.Key == preferred)
+                        {
+                            matched = entry.Key;
+                            return entry.Value;
+                        }
+                    }
                 }
             }
         }
@@ -1103,6 +1369,13 @@ internal static class RadioBinding
         {
         }
         return null;
+    }
+
+    internal static string DetectedPidHex()
+    {
+        RadioTarget matched;
+        string service = Service(out matched);
+        return (service != null && matched != null) ? matched.PidHex : null;
     }
 
     internal static bool Bound(string service)
@@ -1125,21 +1398,33 @@ internal static class RadioBinding
         return null;
     }
 
+    [System.Runtime.InteropServices.DllImport("newdev.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool UpdateDriverForPlugAndPlayDevices(
+        IntPtr hwndParent,
+        string hardwareId,
+        string fullInfPath,
+        uint installFlags,
+        out bool rebootRequired);
+
+    private const uint InstallFlagForce = 0x00000001;
+
     /// <summary>
-    /// Bind MI_02 to WinUSB, elevating once if needed. Idempotent: when the
-    /// interface is already on WinUSB this returns 0 without touching anything.
+    /// Bind the target Wi-Fi interface to WinUSB, elevating once if needed.
+    /// Idempotent: when already on WinUSB this returns 0 without touching anything.
     /// </summary>
     internal static int Install(string root, bool quiet, string logPath)
     {
-        string service = Service();
+        RadioTarget matched;
+        string service = Service(out matched);
         if (service == null)
         {
-            Log(logPath, "install: MI_02 not present; plug the card in first");
+            Log(logPath, "install: supported adapter (8821CU/8811CU) not present; plug the card in first");
             return 3;
         }
+        string label = matched != null ? (matched.Name + " " + matched.InterfaceLabel) : "Wi-Fi";
         if (Bound(service))
         {
-            Log(logPath, "install: already bound to WinUSB; nothing to do");
+            Log(logPath, "install: " + label + " already bound to WinUSB; nothing to do");
             return 0;
         }
         if (!IsAdmin())
@@ -1189,12 +1474,290 @@ internal static class RadioBinding
         code = Run("certutil.exe", "-addstore -f TrustedPublisher \"" + cer + "\"", logPath);
         if (code != 0) return 1;
         code = Run("pnputil.exe", "/add-driver \"" + inf + "\" /install", logPath);
-        if (code != 0) return 1;
-
-        service = Service();
+        service = Service(out matched);
+        if (!Bound(service) && matched != null)
+        {
+            string hwid = matched.Prefix.TrimEnd('\\');
+            bool rebootRequired;
+            bool ok = UpdateDriverForPlugAndPlayDevices(IntPtr.Zero, hwid, inf, InstallFlagForce, out rebootRequired);
+            int err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+            Log(logPath, "install: UpdateDriverForPlugAndPlayDevices(" + hwid + ", FORCE) -> " +
+                         ok + " (err=" + err + ", reboot=" + rebootRequired + ")");
+            service = Service(out matched);
+        }
+        else if (code != 0 && !Bound(service))
+        {
+            return 1;
+        }
         bool bound = Bound(service);
-        Log(logPath, "install: after pnputil, MI_02 service=" + (service ?? "<absent>"));
+        Log(logPath, "install: after install, " + label + " service=" + (service ?? "<absent>"));
         return bound ? 0 : 1;
+    }
+
+    internal static bool AssessNetworkRisk(bool targetIsUp, bool hasOtherUpNetwork)
+    {
+        return targetIsUp && !hasOtherUpNetwork;
+    }
+
+    internal static bool IsTargetAdapterDescription(string description)
+    {
+        if (string.IsNullOrEmpty(description)) return false;
+        return description.IndexOf("8821", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               description.IndexOf("8811", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    internal static RadioInspection Inspect()
+    {
+        var info = new RadioInspection();
+        try
+        {
+            var clauses = new List<string>();
+            foreach (RadioTarget target in Targets)
+            {
+                clauses.Add("DeviceID LIKE '" + target.WqlLike + "'");
+            }
+            string query = "SELECT DeviceID, Name, Service FROM Win32_PnPEntity WHERE " +
+                           string.Join(" OR ", clauses);
+            using (var searcher = new ManagementObjectSearcher(query))
+            {
+                var found = new List<RadioInspection>();
+                foreach (ManagementObject item in searcher.Get())
+                {
+                    string deviceId = item["DeviceID"] as string;
+                    RadioTarget target = MatchTarget(deviceId);
+                    if (target == null) continue;
+                    found.Add(new RadioInspection
+                    {
+                        Target = target,
+                        DeviceId = deviceId,
+                        FriendlyName = (item["Name"] as string) ?? target.Name,
+                        Service = (item["Service"] as string) ?? string.Empty,
+                    });
+                }
+                foreach (RadioTarget preferred in Targets)
+                {
+                    foreach (RadioInspection candidate in found)
+                    {
+                        if (candidate.Target == preferred)
+                        {
+                            info = candidate;
+                            break;
+                        }
+                    }
+                    if (info.Target != null) break;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            var nics = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces();
+            foreach (var nic in nics)
+            {
+                if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                if (nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback ||
+                    nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Tunnel)
+                {
+                    continue;
+                }
+                if (IsTargetAdapterDescription(nic.Description))
+                {
+                    info.TargetIsUp = true;
+                    info.ActiveAdapterName = nic.Name + " (" + nic.Description + ")";
+                }
+                else
+                {
+                    info.HasOtherUpNetwork = true;
+                }
+            }
+        }
+        catch
+        {
+        }
+        return info;
+    }
+
+    internal static List<string> ParsePublishedInfNames(string pnputilOutput, string originalInfName)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(pnputilOutput) || string.IsNullOrEmpty(originalInfName)) return result;
+        string currentPublished = null;
+        string[] lines = pnputilOutput.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (string raw in lines)
+        {
+            string line = raw.Trim();
+            int colon = line.IndexOf(':');
+            if (colon < 0) continue;
+            string value = line.Substring(colon + 1).Trim();
+            if (value.EndsWith(".inf", StringComparison.OrdinalIgnoreCase))
+            {
+                if (value.StartsWith("oem", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentPublished = value;
+                }
+                else if (string.Equals(value, originalInfName, StringComparison.OrdinalIgnoreCase) &&
+                         !string.IsNullOrEmpty(currentPublished))
+                {
+                    if (!result.Contains(currentPublished)) result.Add(currentPublished);
+                    currentPublished = null;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static string ServiceWithDeviceId(out RadioTarget matched, out string deviceId)
+    {
+        matched = null;
+        deviceId = null;
+        try
+        {
+            var clauses = new List<string>();
+            foreach (RadioTarget target in Targets)
+            {
+                clauses.Add("DeviceID LIKE '" + target.WqlLike + "'");
+            }
+            string query = "SELECT DeviceID, Service FROM Win32_PnPEntity WHERE " +
+                           string.Join(" OR ", clauses);
+            using (var searcher = new ManagementObjectSearcher(query))
+            {
+                var found = new List<KeyValuePair<RadioTarget, KeyValuePair<string, string>>>();
+                foreach (ManagementObject item in searcher.Get())
+                {
+                    string id = item["DeviceID"] as string;
+                    RadioTarget target = MatchTarget(id);
+                    if (target == null) continue;
+                    string svc = (item["Service"] as string) ?? string.Empty;
+                    found.Add(new KeyValuePair<RadioTarget, KeyValuePair<string, string>>(
+                        target, new KeyValuePair<string, string>(id, svc)));
+                }
+                foreach (RadioTarget preferred in Targets)
+                {
+                    foreach (var entry in found)
+                    {
+                        if (entry.Key == preferred)
+                        {
+                            matched = entry.Key;
+                            deviceId = entry.Value.Key;
+                            return entry.Value.Value;
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Remove DropBridge's WinUSB binding and re-enumerate the adapter so Windows
+    /// restores the vendor Realtek Wi-Fi driver. Elevates once if needed.
+    /// </summary>
+    internal static int Restore(string logPath)
+    {
+        RadioTarget matched;
+        string deviceId;
+        string service = ServiceWithDeviceId(out matched, out deviceId);
+        if (!IsAdmin())
+        {
+            try
+            {
+                var start = new ProcessStartInfo(Application.ExecutablePath)
+                {
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    Arguments = "--restore-driver --log " + Supervisor.QuoteArgument(logPath),
+                };
+                using (Process child = Process.Start(start))
+                {
+                    child.WaitForExit();
+                    Log(logPath, "restore: elevated helper exit " + child.ExitCode);
+                    return child.ExitCode;
+                }
+            }
+            catch (Exception error)
+            {
+                Log(logPath, "restore: elevation refused: " + error.Message);
+                return 2;
+            }
+        }
+
+        string enumOut;
+        RunCapture("pnputil.exe", "/enum-drivers", logPath, out enumOut);
+        List<string> published = ParsePublishedInfNames(enumOut, "airbridge-winusb.inf");
+        foreach (string oemInf in published)
+        {
+            Run("pnputil.exe", "/delete-driver " + oemInf + " /uninstall /force", logPath);
+        }
+
+        service = ServiceWithDeviceId(out matched, out deviceId);
+        if (service != null && Bound(service) && !string.IsNullOrEmpty(deviceId))
+        {
+            Run("pnputil.exe", "/remove-device \"" + deviceId + "\"", logPath);
+            Run("pnputil.exe", "/scan-devices", logPath);
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                Thread.Sleep(500);
+                service = ServiceWithDeviceId(out matched, out deviceId);
+                if (service != null && !Bound(service)) break;
+            }
+        }
+        else if (published.Count > 0)
+        {
+            Run("pnputil.exe", "/scan-devices", logPath);
+        }
+
+        service = ServiceWithDeviceId(out matched, out deviceId);
+        Log(logPath, "restore: final service=" + (service ?? "<absent>"));
+        if (service == null) return 3;
+        return Bound(service) ? 1 : 0;
+    }
+
+    private static int RunCapture(string exe, string arguments, string logPath, out string captured)
+    {
+        captured = string.Empty;
+        try
+        {
+            var start = new ProcessStartInfo(exe, arguments)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            using (Process process = Process.Start(start))
+            {
+                System.Threading.Tasks.Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+                System.Threading.Tasks.Task<string> stderr = process.StandardError.ReadToEndAsync();
+                if (!process.WaitForExit(120000))
+                {
+                    try { process.Kill(); }
+                    catch (Exception) { }
+                    return 1;
+                }
+                try
+                {
+                    System.Threading.Tasks.Task.WaitAll(new System.Threading.Tasks.Task[] { stdout, stderr }, 2000);
+                    if (stdout.IsCompleted) captured += stdout.Result;
+                    if (stderr.IsCompleted) captured += stderr.Result;
+                }
+                catch (Exception)
+                {
+                }
+                Log(logPath, exe + " " + arguments + " -> exit " + process.ExitCode);
+                return process.ExitCode;
+            }
+        }
+        catch (Exception error)
+        {
+            Log(logPath, exe + " failed: " + error.Message);
+            return 1;
+        }
     }
 
     private static int Run(string exe, string arguments, string logPath)
@@ -1441,6 +2004,522 @@ internal sealed class DeviceNameDialog : Form
     }
 }
 
+internal static class SendHelpers
+{
+    public static string ValidateSendFiles(IEnumerable<string> paths, out List<string> valid)
+    {
+        valid = new List<string>();
+        var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string p in paths)
+        {
+            if (string.IsNullOrEmpty(p) || !File.Exists(p))
+            {
+                return "文件不存在：" + (p ?? "");
+            }
+            string name = Path.GetFileName(p);
+            if (!seenNames.Add(name))
+            {
+                return "存在同名文件，无法同时发送：" + name;
+            }
+            valid.Add(p);
+        }
+        if (valid.Count == 0) return "请先添加至少一个文件";
+        return null;
+    }
+
+    public static string JsonGetString(string json, string key)
+    {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return null;
+        string pattern = "\"" + key + "\"";
+        int idx = json.IndexOf(pattern, StringComparison.Ordinal);
+        if (idx < 0) return null;
+        int colon = json.IndexOf(':', idx + pattern.Length);
+        if (colon < 0) return null;
+        int i = colon + 1;
+        while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+        if (i >= json.Length || json[i] != '"') return null;
+        i++;
+        var sb = new StringBuilder();
+        while (i < json.Length)
+        {
+            char c = json[i++];
+            if (c == '"') return sb.ToString();
+            if (c == '\\' && i < json.Length)
+            {
+                char next = json[i++];
+                if (next == '"' || next == '\\' || next == '/') sb.Append(next);
+                else if (next == 'n') sb.Append('\n');
+                else if (next == 'r') sb.Append('\r');
+                else if (next == 't') sb.Append('\t');
+                else if (next == 'u' && i + 4 <= json.Length)
+                {
+                    int code;
+                    if (int.TryParse(json.Substring(i, 4), System.Globalization.NumberStyles.HexNumber,
+                            System.Globalization.CultureInfo.InvariantCulture, out code))
+                    {
+                        sb.Append((char)code);
+                        i += 4;
+                    }
+                }
+                else sb.Append(next);
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return null;
+    }
+
+    public static long JsonGetLong(string json, string key, long fallback)
+    {
+        if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return fallback;
+        string pattern = "\"" + key + "\"";
+        int idx = json.IndexOf(pattern, StringComparison.Ordinal);
+        if (idx < 0) return fallback;
+        int colon = json.IndexOf(':', idx + pattern.Length);
+        if (colon < 0) return fallback;
+        int i = colon + 1;
+        while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+        int start = i;
+        if (i < json.Length && json[i] == '-') i++;
+        while (i < json.Length && char.IsDigit(json[i])) i++;
+        if (i == start) return fallback;
+        long val;
+        if (long.TryParse(json.Substring(start, i - start), out val)) return val;
+        return fallback;
+    }
+
+    public static string JsonEscape(string s)
+    {
+        if (s == null) return "";
+        var sb = new StringBuilder(s.Length + 8);
+        foreach (char c in s)
+        {
+            if (c == '\\') sb.Append("\\\\");
+            else if (c == '"') sb.Append("\\\"");
+            else if (c == '\r') sb.Append("\\r");
+            else if (c == '\n') sb.Append("\\n");
+            else if (c == '\t') sb.Append("\\t");
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
+}
+
+internal sealed class SendFilesDialog : Form
+{
+    private sealed class PeerItem
+    {
+        public string Id;
+        public string Name;
+        public string Model;
+
+        public override string ToString()
+        {
+            return string.IsNullOrEmpty(Model) ? Name : (Name + " (" + Model + ")");
+        }
+    }
+
+    private readonly Supervisor _supervisor;
+    private readonly Settings _prefs;
+    private readonly List<string> _files = new List<string>();
+    private readonly ListBox _fileList;
+    private readonly ListBox _peerList;
+    private readonly Label _shyLabel;
+    private readonly Label _statusLabel;
+    private readonly ProgressBar _progress;
+    private readonly Button _sendButton;
+    private readonly Button _cancelButton;
+    private Process _proc;
+    private bool _sending;
+
+    public SendFilesDialog(Supervisor supervisor, Settings prefs, string[] initialFiles)
+    {
+        _supervisor = supervisor;
+        _prefs = prefs;
+
+        Text = "DropBridge — 发送文件到 iPhone";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        AutoScaleMode = AutoScaleMode.Font;
+        ClientSize = new Size(520, 470);
+        AllowDrop = true;
+
+        var fileLabel = new Label
+        {
+            Text = "待发送文件（支持直接拖拽文件到窗口内）：",
+            Location = new Point(16, 14),
+            Size = new Size(488, 20),
+        };
+
+        _fileList = new ListBox
+        {
+            Location = new Point(16, 36),
+            Size = new Size(488, 96),
+            HorizontalScrollbar = true,
+        };
+
+        var addBtn = new Button { Text = "添加文件…", Location = new Point(16, 138), Size = new Size(92, 28) };
+        var rmBtn = new Button { Text = "移除选中", Location = new Point(114, 138), Size = new Size(86, 28) };
+        var clrBtn = new Button { Text = "清空", Location = new Point(206, 138), Size = new Size(64, 28) };
+
+        var peerLabel = new Label
+        {
+            Text = "附近的接收设备（请让 iPhone 隔空投送保持「所有人 10 分钟」）：",
+            Location = new Point(16, 178),
+            Size = new Size(488, 20),
+        };
+
+        _peerList = new ListBox
+        {
+            Location = new Point(16, 200),
+            Size = new Size(488, 108),
+        };
+
+        _shyLabel = new Label
+        {
+            Text = "提示：检测到附近有 Apple 设备开启了「仅限联系人」，请在 iPhone 控制中心临时设为「所有人（10 分钟）」。",
+            ForeColor = Color.FromArgb(146, 64, 14),
+            BackColor = Color.FromArgb(254, 243, 199),
+            Padding = new Padding(6, 4, 6, 4),
+            Location = new Point(16, 314),
+            Size = new Size(488, 38),
+            Visible = false,
+        };
+
+        _statusLabel = new Label
+        {
+            Text = "正在搜索附近设备…",
+            Location = new Point(16, 360),
+            Size = new Size(488, 22),
+        };
+
+        _progress = new ProgressBar
+        {
+            Location = new Point(16, 386),
+            Size = new Size(488, 20),
+            Minimum = 0,
+            Maximum = 100,
+        };
+
+        _sendButton = new Button
+        {
+            Text = "发送给选中设备",
+            Enabled = false,
+            Location = new Point(186, 422),
+            Size = new Size(124, 30),
+        };
+
+        _cancelButton = new Button
+        {
+            Text = "取消发送",
+            Enabled = false,
+            Location = new Point(316, 422),
+            Size = new Size(92, 30),
+        };
+
+        var closeButton = new Button
+        {
+            Text = "关闭",
+            Location = new Point(414, 422),
+            Size = new Size(90, 30),
+        };
+
+        addBtn.Click += delegate { PickFiles(); };
+        rmBtn.Click += delegate { RemoveSelected(); };
+        clrBtn.Click += delegate { _files.Clear(); RefreshFiles(); };
+        _peerList.SelectedIndexChanged += delegate { UpdateButtons(); };
+        _sendButton.Click += delegate { StartSend(); };
+        _cancelButton.Click += delegate { CancelSend(); };
+        closeButton.Click += delegate { Close(); };
+
+        DragEnter += delegate(object s, DragEventArgs e)
+        {
+            if (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+                e.Effect = DragDropEffects.Copy;
+        };
+        DragDrop += delegate(object s, DragEventArgs e)
+        {
+            if (e.Data == null) return;
+            string[] dropped = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (dropped != null) AddPaths(dropped);
+        };
+
+        Controls.Add(fileLabel);
+        Controls.Add(_fileList);
+        Controls.Add(addBtn);
+        Controls.Add(rmBtn);
+        Controls.Add(clrBtn);
+        Controls.Add(peerLabel);
+        Controls.Add(_peerList);
+        Controls.Add(_shyLabel);
+        Controls.Add(_statusLabel);
+        Controls.Add(_progress);
+        Controls.Add(_sendButton);
+        Controls.Add(_cancelButton);
+        Controls.Add(closeButton);
+
+        if (initialFiles != null) AddPaths(initialFiles);
+        Shown += delegate { StartHelper(); };
+        FormClosing += delegate { StopHelper(); };
+    }
+
+    private void AddPaths(string[] paths)
+    {
+        foreach (string p in paths)
+        {
+            if (!string.IsNullOrEmpty(p) && File.Exists(p) && !_files.Contains(p))
+            {
+                _files.Add(p);
+            }
+        }
+        RefreshFiles();
+    }
+
+    private void PickFiles()
+    {
+        using (var dlg = new OpenFileDialog { Multiselect = true, Title = "选择要发送到 iPhone 的文件" })
+        {
+            if (dlg.ShowDialog() == DialogResult.OK) AddPaths(dlg.FileNames);
+        }
+    }
+
+    private void RemoveSelected()
+    {
+        int idx = _fileList.SelectedIndex;
+        if (idx >= 0 && idx < _files.Count)
+        {
+            _files.RemoveAt(idx);
+            RefreshFiles();
+        }
+    }
+
+    private void RefreshFiles()
+    {
+        _fileList.Items.Clear();
+        foreach (string f in _files)
+        {
+            long len = 0;
+            try { len = new FileInfo(f).Length; }
+            catch (Exception) { }
+            string sizeStr = len >= 1048576
+                ? string.Format("{0:0.0} MB", len / 1048576.0)
+                : string.Format("{0:0} KB", Math.Max(1, len / 1024));
+            _fileList.Items.Add(Path.GetFileName(f) + "  (" + sizeStr + ")");
+        }
+        UpdateButtons();
+    }
+
+    private void UpdateButtons()
+    {
+        _sendButton.Enabled = !_sending && _files.Count > 0 && _peerList.SelectedItem != null && _proc != null;
+        _cancelButton.Enabled = _sending;
+    }
+
+    private void StartHelper()
+    {
+        string python = _supervisor.PythonPath();
+        string script = _supervisor.SenderPath();
+        if (!File.Exists(python) || !File.Exists(script))
+        {
+            _statusLabel.Text = "缺少发送组件：" + script;
+            return;
+        }
+        var psi = new ProcessStartInfo(python,
+            "-u " + Supervisor.QuoteArgument(script) +
+            " --json --name " + Supervisor.QuoteArgument(_prefs.DeviceName))
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        psi.EnvironmentVariables["DROPBRIDGE_APPLE_IDENTITY"] = _supervisor.AppleIdentityDirectory;
+        try
+        {
+            _proc = Process.Start(psi);
+            ChildJob.Add(_proc);
+            _proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (!string.IsNullOrEmpty(e.Data)) OnJsonLine(e.Data);
+            };
+            _proc.BeginOutputReadLine();
+            _proc.BeginErrorReadLine();
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "启动发送助手失败：" + ex.Message;
+        }
+    }
+
+    private void OnJsonLine(string line)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            BeginInvoke((MethodInvoker)delegate { HandleEvent(line); });
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private void HandleEvent(string line)
+    {
+        string ev = SendHelpers.JsonGetString(line, "event");
+        if (string.IsNullOrEmpty(ev)) return;
+        if (ev == "peer")
+        {
+            string id = SendHelpers.JsonGetString(line, "id");
+            string name = SendHelpers.JsonGetString(line, "name");
+            string model = SendHelpers.JsonGetString(line, "model");
+            for (int i = 0; i < _peerList.Items.Count; i++)
+            {
+                var existing = _peerList.Items[i] as PeerItem;
+                if (existing != null && existing.Id == id) return;
+            }
+            var item = new PeerItem { Id = id, Name = name ?? id, Model = model ?? "" };
+            _peerList.Items.Add(item);
+            if (_peerList.SelectedIndex < 0) _peerList.SelectedIndex = 0;
+            if (!_sending) _statusLabel.Text = "已发现附近设备，选中后点击发送。";
+            UpdateButtons();
+        }
+        else if (ev == "peer_lost")
+        {
+            string id = SendHelpers.JsonGetString(line, "id");
+            for (int i = _peerList.Items.Count - 1; i >= 0; i--)
+            {
+                var existing = _peerList.Items[i] as PeerItem;
+                if (existing != null && existing.Id == id) _peerList.Items.RemoveAt(i);
+            }
+            UpdateButtons();
+        }
+        else if (ev == "shy")
+        {
+            _shyLabel.Visible = true;
+        }
+        else if (ev == "asking")
+        {
+            string peer = SendHelpers.JsonGetString(line, "peer");
+            _progress.Value = 0;
+            _statusLabel.Text = "正在等待 " + (peer ?? "对方") + " 点击“接受”…";
+        }
+        else if (ev == "accepted")
+        {
+            _statusLabel.Text = "对方已接受，正在传输…";
+        }
+        else if (ev == "progress")
+        {
+            long done = SendHelpers.JsonGetLong(line, "done", 0);
+            long total = SendHelpers.JsonGetLong(line, "total", 1);
+            int pct = (int)Math.Min(100, Math.Max(0, done * 100 / Math.Max(total, 1)));
+            _progress.Value = pct;
+            _statusLabel.Text = "正在发送：" + pct + "%";
+        }
+        else if (ev == "sent")
+        {
+            _sending = false;
+            _progress.Value = 100;
+            _statusLabel.Text = "✓ 发送完成！";
+            UpdateButtons();
+        }
+        else if (ev == "declined")
+        {
+            _sending = false;
+            _statusLabel.Text = "对方拒绝了本次发送。";
+            UpdateButtons();
+        }
+        else if (ev == "cancelled")
+        {
+            _sending = false;
+            _statusLabel.Text = "已取消发送。";
+            UpdateButtons();
+        }
+        else if (ev == "error")
+        {
+            _sending = false;
+            string reason = SendHelpers.JsonGetString(line, "reason");
+            _statusLabel.Text = reason ?? "发送失败";
+            UpdateButtons();
+        }
+    }
+
+    private void StartSend()
+    {
+        var peer = _peerList.SelectedItem as PeerItem;
+        if (peer == null || _proc == null || _proc.HasExited) return;
+        List<string> valid;
+        string problem = SendHelpers.ValidateSendFiles(_files, out valid);
+        if (problem != null)
+        {
+            MessageBox.Show(problem, "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var fileJson = new List<string>();
+        foreach (string f in valid) fileJson.Add("\"" + SendHelpers.JsonEscape(f) + "\"");
+        string cmd = "{\"do\":\"send\",\"peer\":\"" + SendHelpers.JsonEscape(peer.Id) +
+                     "\",\"files\":[" + string.Join(",", fileJson.ToArray()) + "]}";
+        _sending = true;
+        _progress.Value = 0;
+        UpdateButtons();
+        try
+        {
+            _proc.StandardInput.WriteLine(cmd);
+            _proc.StandardInput.Flush();
+        }
+        catch (Exception ex)
+        {
+            _sending = false;
+            _statusLabel.Text = "发送指令失败：" + ex.Message;
+            UpdateButtons();
+        }
+    }
+
+    private void CancelSend()
+    {
+        if (_proc == null || _proc.HasExited) return;
+        try
+        {
+            _proc.StandardInput.WriteLine("{\"do\":\"cancel\"}");
+            _proc.StandardInput.Flush();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private void StopHelper()
+    {
+        if (_proc == null) return;
+        try
+        {
+            if (!_proc.HasExited)
+            {
+                try
+                {
+                    _proc.StandardInput.WriteLine("{\"do\":\"quit\"}");
+                    _proc.StandardInput.Flush();
+                }
+                catch (Exception) { }
+                if (!_proc.WaitForExit(300)) _proc.Kill();
+            }
+        }
+        catch (Exception)
+        {
+        }
+        finally
+        {
+            _proc.Dispose();
+            _proc = null;
+        }
+    }
+}
+
 internal sealed class TrayApp : ApplicationContext
 {
     private readonly Supervisor _supervisor;
@@ -1450,6 +2529,7 @@ internal sealed class TrayApp : ApplicationContext
     private int _trayPixels;
     private readonly ToolStripMenuItem _status;
     private readonly ToolStripMenuItem _autostart;
+    private readonly ToolStripMenuItem _sendToItem;
     private readonly System.Windows.Forms.Timer _watchdog;
     private SynchronizationContext _ui;
     private FileSystemWatcher _watcher;
@@ -1495,6 +2575,10 @@ internal sealed class TrayApp : ApplicationContext
         _ui = SynchronizationContext.Current as WindowsFormsSynchronizationContext;
         _status = new ToolStripMenuItem("状态：启动中…") { Enabled = false };
         menu.Items.Add(_status);
+        menu.Items.Add(new ToolStripMenuItem("打开主界面", null,
+            delegate { OpenDashboard(); }));
+        menu.Items.Add(new ToolStripMenuItem("发送文件到 iPhone…", null,
+            delegate { OpenSendDialog(null); }) { ToolTipText = "通过隔空投送把电脑上的文件发给附近的 iPhone（需手机设为「所有人 10 分钟」）" });
         menu.Items.Add(new ToolStripMenuItem("打开接收文件夹", null,
             delegate { OpenFolder(_supervisor.ReceivedDirectory); }));
         _folderItem = new ToolStripMenuItem("接收文件夹：" + ShortPath(_supervisor.ReceivedDirectory) + "…", null,
@@ -1508,11 +2592,16 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add(_autostart);
         menu.Items.Add(new ToolStripMenuItem("安装驱动（首次使用）", null,
             delegate { InstallDriver(); }));
+        menu.Items.Add(new ToolStripMenuItem("恢复原厂 Wi-Fi 驱动…", null,
+            delegate { RestoreDriver(); }) { ToolTipText = "卸载 WinUSB 绑定并恢复网卡原厂 Realtek Wi-Fi 驱动，恢复后该网卡可重新连接普通 Wi-Fi" });
         _nameItem = new ToolStripMenuItem("设备名称：" + _prefs.DeviceName + "…", null,
             delegate { RenameDevice(); }) { ToolTipText = "iPhone 隔空投送里显示的名字；改完立即生效并记住" };
         menu.Items.Add(_nameItem);
         menu.Items.Add(new ToolStripMenuItem("清理通知注册信息", null,
-            delegate { RemoveRegistration(); }) { ToolTipText = "删掉开始菜单快捷方式与 dropbridge:// 协议（取消后系统通知里的按钮不再可用）" });
+            delegate { RemoveRegistration(); }) { ToolTipText = "删掉开始菜单快捷方式、dropbridge:// 协议与右键「发送到」快捷方式" });
+        _sendToItem = new ToolStripMenuItem("添加到右键「发送到」菜单", null,
+            delegate { ToggleSendTo(); }) { Checked = AppIdentity.HasSendToShortcut(), ToolTipText = "在资源管理器右键「发送到」里加入 DropBridge" };
+        menu.Items.Add(_sendToItem);
         _beaconWanted = _prefs.Beacon;
         _beaconItem = new ToolStripMenuItem("蓝牙 beacon（帮 iPhone 发现这台电脑）", null,
             delegate { ToggleBeacon(); }) { Checked = _beaconWanted, ToolTipText = "周期性发送 Apple 的 AirDrop 蓝牙广播，让 iPhone 的 AWDL 保持唤醒；关掉后手机可能看不到本机" };
@@ -1539,7 +2628,10 @@ internal sealed class TrayApp : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true,
         };
-        _icon.DoubleClick += delegate { OpenFolder(_supervisor.ReceivedDirectory); };
+        _icon.DoubleClick += delegate
+        {
+            if (!OpenDashboard()) OpenFolder(_supervisor.ReceivedDirectory);
+        };
         SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
 
         // Q62: the toast button talks back through a named pipe; the protocol and
@@ -1552,26 +2644,35 @@ internal sealed class TrayApp : ApplicationContext
             LogLine("notification registration failed: " + registrationError);
         }
 
-        if (_supervisor.UnavailableReceivedFolder != null)
+        if (!Program.SilentMode)
         {
-            _icon.ShowBalloonTip(8000, _icon.Text,
-                "接收文件夹 " + _supervisor.UnavailableReceivedFolder + " 现在不可用，本次改存到 " +
-                _supervisor.ReceivedDirectory + "。正在启动后端…", ToolTipIcon.Warning);
-        }
-        else
-        {
-            _icon.ShowBalloonTip(3000, _icon.Text, "正在启动后端…", ToolTipIcon.Info);
+            if (_supervisor.UnavailableReceivedFolder != null)
+            {
+                _icon.ShowBalloonTip(8000, _icon.Text,
+                    "接收文件夹 " + _supervisor.UnavailableReceivedFolder + " 现在不可用，本次改存到 " +
+                    _supervisor.ReceivedDirectory + "。正在启动后端…", ToolTipIcon.Warning);
+            }
+            else
+            {
+                _icon.ShowBalloonTip(3000, _icon.Text, "正在启动后端…", ToolTipIcon.Info);
+            }
         }
 
         Application.Idle += CaptureContext;
         StartWatcher();
         StartBackends();
-        StartFirstRunCheck();
+        if (!Program.SilentMode) StartFirstRunCheck();
         OfferAutostartOnce();
         StartBeacon();
+        WriteStatusJson();
+
+        if (!Program.SilentMode && autoExitSeconds <= 0 && string.IsNullOrEmpty(Program.PendingActivation))
+        {
+            OpenDashboard();
+        }
 
         _watchdog = new System.Windows.Forms.Timer { Interval = 5000 };
-        _watchdog.Tick += delegate { CheckSilence(); CheckChildren(); CheckBeacon(); };
+        _watchdog.Tick += delegate { CheckSilence(); CheckChildren(); CheckBeacon(); WriteStatusJson(); };
         _watchdog.Start();
 
         if (autoExitSeconds > 0)
@@ -1778,16 +2879,59 @@ internal sealed class TrayApp : ApplicationContext
     // thread; a burst of photos must not start 30 PowerShells at once.
     private readonly object _toastGate = new object();
 
+    private static void PlayReceivedSound()
+    {
+        try
+        {
+            string mediaDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Media");
+            string[] candidates =
+            {
+                Path.Combine(mediaDir, "Windows Notify Messaging.wav"),
+                Path.Combine(mediaDir, "Windows Notify System Generic.wav"),
+                Path.Combine(mediaDir, "Windows Notify.wav"),
+            };
+            foreach (string wav in candidates)
+            {
+                if (File.Exists(wav))
+                {
+                    using (var player = new System.Media.SoundPlayer(wav))
+                    {
+                        player.Play();
+                    }
+                    return;
+                }
+            }
+            System.Media.SystemSounds.Asterisk.Play();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
     // Runs on the file's waiter thread; only the balloons go to the UI thread.
     private void ShowReceived(string path, string name, long bytes)
     {
         if (_exiting) return;
         string extension = Path.GetExtension(name).ToLowerInvariant();
-        if (Array.IndexOf(PictureExtensions, extension) < 0)
+        if (Array.IndexOf(PictureExtensions, extension) < 0 &&
+            Array.IndexOf(MotionExtensions, extension) >= 0 &&
+            HasStillSibling(path, name))
         {
             // Q64: the movie half of a Live Photo is announced by the picture's
-            // own toast, so do not add a second notification for it.
-            if (Array.IndexOf(MotionExtensions, extension) >= 0 && HasStillSibling(path, name)) return;
+            // own toast, so do not add a second notification or sound for it.
+            return;
+        }
+        if (_prefs.NotifySound)
+        {
+            PlayReceivedSound();
+        }
+        if (!_prefs.NotifyToast)
+        {
+            LogLine("received file (notification muted): " + name);
+            return;
+        }
+        if (Array.IndexOf(PictureExtensions, extension) < 0)
+        {
             LogLine("received file (balloon): " + name);
             // Q67: keep this short; the file is already on disk and the toast was
             // only telling the user that something arrived.
@@ -1830,9 +2974,20 @@ internal sealed class TrayApp : ApplicationContext
         });
     }
 
-    /* Q62: the toast button launched us with dropbridge://copy?file=... */
+    /* Q62/Q74: handle dropbridge://copy?file=..., dropbridge://send?file=..., or dropbridge://ui?cmd=... */
     private void HandleActivation(string uri)
     {
+        if (Activation.IsUiUri(uri))
+        {
+            HandleUiCommand(uri);
+            return;
+        }
+        if (Activation.IsSendUri(uri))
+        {
+            string[] files = Activation.FilesFromSendUri(uri);
+            OpenSendDialog(files);
+            return;
+        }
         string file = Activation.FileFromUri(uri);
         if (string.IsNullOrEmpty(file))
         {
@@ -1880,13 +3035,374 @@ internal sealed class TrayApp : ApplicationContext
         }
     }
 
+    private static string ReadSmallText(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) return File.ReadAllText(path, Encoding.UTF8).Trim();
+        }
+        catch (Exception) { }
+        return "";
+    }
+
+    internal static string NormalizeAndHashContact(string input)
+    {
+        if (string.IsNullOrEmpty(input)) return null;
+        string s = input.Trim();
+        if (s.Length == 0) return null;
+        string norm;
+        if (s.IndexOf('@') >= 0)
+        {
+            norm = s.ToLowerInvariant();
+        }
+        else
+        {
+            var sb = new StringBuilder();
+            foreach (char ch in s)
+            {
+                if (char.IsDigit(ch) || ch == '+') sb.Append(ch);
+            }
+            string digits = sb.ToString();
+            if (digits.Length == 0) return null;
+            if (digits.StartsWith("00")) digits = "+" + digits.Substring(2);
+            else if (!digits.StartsWith("+"))
+            {
+                if (digits.Length == 11 && digits.StartsWith("1")) digits = "+86" + digits;
+                else digits = "+" + digits;
+            }
+            norm = digits;
+        }
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+        {
+            byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(norm));
+            var hex = new StringBuilder(64);
+            foreach (byte b in bytes) hex.Append(b.ToString("x2"));
+            return hex.ToString();
+        }
+    }
+
+    private bool OpenDashboard()
+    {
+        try
+        {
+            string uiExe = Path.Combine(_supervisor.Root, "DropBridgeUI.exe");
+            if (!File.Exists(uiExe))
+            {
+                string devExe = Path.GetFullPath(Path.Combine(_supervisor.Root, "build", "ui_rust", "DropBridgeUI.exe"));
+                if (File.Exists(devExe)) uiExe = devExe;
+            }
+            if (!File.Exists(uiExe)) return false;
+            Process.Start(new ProcessStartInfo(uiExe)
+            {
+                WorkingDirectory = _supervisor.Root,
+                Arguments = "--root " + Supervisor.QuoteArgument(_supervisor.Root) +
+                            " --data " + Supervisor.QuoteArgument(_supervisor.DataDirectory),
+                UseShellExecute = true,
+            });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogLine("open dashboard failed: " + ex.Message);
+            return false;
+        }
+    }
+
+    private void WriteStatusJson()
+    {
+        try
+        {
+            string dataDir = _supervisor.DataDirectory;
+            Directory.CreateDirectory(dataDir);
+            RadioInspection info = RadioBinding.Inspect();
+            string appleDir = _supervisor.AppleIdentityDirectory;
+            bool applePresent =
+                File.Exists(Path.Combine(appleDir, "certificate.der")) &&
+                File.Exists(Path.Combine(appleDir, "key.pk8.der")) &&
+                File.Exists(Path.Combine(appleDir, "validation_record.cms"));
+            int contactCount = 0;
+            string hashesPath = Path.Combine(appleDir, "contact_hashes.txt");
+            if (File.Exists(hashesPath))
+            {
+                foreach (string line in File.ReadAllLines(hashesPath, Encoding.UTF8))
+                {
+                    if (line.Trim().Length == 64) contactCount++;
+                }
+            }
+            string json =
+                "{" +
+                "\"running\":" + (_supervisor.Running ? "true" : "false") + "," +
+                "\"statusText\":\"" + SendHelpers.JsonEscape(_status.Text) + "\"," +
+                "\"deviceName\":\"" + SendHelpers.JsonEscape(_prefs.DeviceName) + "\"," +
+                "\"receivedFolder\":\"" + SendHelpers.JsonEscape(_supervisor.ReceivedDirectory) + "\"," +
+                "\"logDirectory\":\"" + SendHelpers.JsonEscape(_supervisor.LogDirectory) + "\"," +
+                "\"beacon\":" + (_beaconWanted ? "true" : "false") + "," +
+                "\"stillCopy\":" + (_prefs.StillCopy ? "true" : "false") + "," +
+                "\"notifySound\":" + (_prefs.NotifySound ? "true" : "false") + "," +
+                "\"notifyToast\":" + (_prefs.NotifyToast ? "true" : "false") + "," +
+                "\"autostart\":" + (AutostartEnabled() ? "true" : "false") + "," +
+                "\"sendTo\":" + (AppIdentity.HasSendToShortcut() ? "true" : "false") + "," +
+                "\"receiveMode\":\"" + SendHelpers.JsonEscape(_prefs.ReceiveMode) + "\"," +
+                "\"mediaFormat\":\"" + SendHelpers.JsonEscape(_prefs.MediaFormat) + "\"," +
+                "\"bleHashes\":\"" + SendHelpers.JsonEscape(ReadSmallText(Path.Combine(_supervisor.AppleIdentityDirectory, "ble_hashes.txt"))) + "\"," +
+                "\"myIdentifiers\":\"" + SendHelpers.JsonEscape(ReadSmallText(Path.Combine(_supervisor.AppleIdentityDirectory, "my_identifiers.txt")).Replace("\r", "").Replace("\n", ", ")) + "\"," +
+                "\"appleIdentityPresent\":" + (applePresent ? "true" : "false") + "," +
+                "\"contactCount\":" + contactCount + "," +
+                "\"adapterName\":\"" + SendHelpers.JsonEscape(info.Target != null ? info.Target.Name : "") + "\"," +
+                "\"adapterPid\":\"" + SendHelpers.JsonEscape(info.Target != null ? info.Target.PidHex : "") + "\"," +
+                "\"deviceId\":\"" + SendHelpers.JsonEscape(info.DeviceId ?? "") + "\"," +
+                "\"driverService\":\"" + SendHelpers.JsonEscape(info.Service ?? "") + "\"," +
+                "\"winusbBound\":" + (RadioBinding.Bound(info.Service) ? "true" : "false") + "," +
+                "\"targetIsUp\":" + (info.TargetIsUp ? "true" : "false") + "," +
+                "\"wouldLoseAllNetwork\":" + (info.WouldLoseAllNetwork ? "true" : "false") + "," +
+                "\"pid\":" + Process.GetCurrentProcess().Id +
+                "}";
+            string target = Path.Combine(dataDir, "status.json");
+            string tmp = target + ".tmp";
+            File.WriteAllText(tmp, json, new UTF8Encoding(false));
+            if (File.Exists(target)) File.Replace(tmp, target, null);
+            else File.Move(tmp, target);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private void HandleUiCommand(string uri)
+    {
+        string cmd = Activation.QueryParam(uri, "cmd");
+        if (string.IsNullOrEmpty(cmd)) return;
+        if (cmd == "restart")
+        {
+            StartBackends();
+        }
+        else if (cmd == "reset")
+        {
+            _slowSamples = 0;
+            _slowWarned = false;
+            RequestStart(false);
+        }
+        else if (cmd == "beacon_on" || cmd == "beacon_off")
+        {
+            bool want = cmd == "beacon_on";
+            if (_beaconWanted != want) ToggleBeacon();
+        }
+        else if (cmd == "still_on" || cmd == "still_off")
+        {
+            bool want = cmd == "still_on";
+            if (_prefs.StillCopy != want) ToggleStillCopy();
+        }
+        else if (cmd == "notify_sound_on" || cmd == "notify_sound_off")
+        {
+            _prefs.SetNotifySound(cmd == "notify_sound_on");
+        }
+        else if (cmd == "notify_toast_on" || cmd == "notify_toast_off")
+        {
+            _prefs.SetNotifyToast(cmd == "notify_toast_on");
+        }
+        else if (cmd == "autostart_on" || cmd == "autostart_off")
+        {
+            bool want = cmd == "autostart_on";
+            SetAutostart(want);
+            _autostart.Checked = want;
+        }
+        else if (cmd == "sendto_on" || cmd == "sendto_off")
+        {
+            bool want = cmd == "sendto_on";
+            string unused;
+            AppIdentity.SetSendToShortcut(want, out unused);
+            if (_sendToItem != null) _sendToItem.Checked = AppIdentity.HasSendToShortcut();
+        }
+        else if (cmd == "open_received")
+        {
+            OpenFolder(_supervisor.ReceivedDirectory);
+        }
+        else if (cmd == "open_logs")
+        {
+            OpenFolder(_supervisor.LogDirectory);
+        }
+        else if (cmd == "rename")
+        {
+            string clean = Settings.CleanName(Activation.QueryParam(uri, "name"));
+            if (clean != null && clean != _prefs.DeviceName)
+            {
+                _prefs.SetDeviceName(clean);
+                _nameItem.Text = "设备名称：" + clean + "…";
+                _icon.Text = clean;
+                AppIdentity.Ensure(clean);
+                RestartReceiverOnly();
+            }
+        }
+        else if (cmd == "set_folder")
+        {
+            string folder = Activation.QueryParam(uri, "folder");
+            string clean = Settings.CleanFolder(folder);
+            if (clean != null)
+            {
+                string error;
+                if (_supervisor.SetReceivedFolder(clean, out error))
+                {
+                    _folderItem.Text = "接收文件夹：" + ShortPath(_supervisor.ReceivedDirectory) + "…";
+                    StartWatcher();
+                    RestartReceiverOnly();
+                }
+            }
+        }
+        else if (cmd == "set_receive_mode")
+        {
+            string mode = Activation.QueryParam(uri, "mode");
+            _prefs.SetReceiveMode(mode);
+            RestartReceiverOnly();
+        }
+        else if (cmd == "set_media_format")
+        {
+            string fmt = Activation.QueryParam(uri, "format");
+            _prefs.SetMediaFormat(fmt);
+            RestartReceiverOnly();
+        }
+        else if (cmd == "pulse_beacon")
+        {
+            try
+            {
+                File.WriteAllText(Path.Combine(_supervisor.DataDirectory, "beacon.pulse"), "1\n", Encoding.ASCII);
+            }
+            catch (Exception) { }
+        }
+        else if (cmd == "set_my_ids")
+        {
+            string ids = Activation.QueryParam(uri, "ids") ?? "";
+            string[] tokens = ids.Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+            var cleanIds = new List<string>();
+            var prefixes = new List<string>();
+            foreach (string raw in tokens)
+            {
+                string t = raw.Trim();
+                if (t.Length == 0) continue;
+                cleanIds.Add(t);
+                string h = NormalizeAndHashContact(t);
+                if (!string.IsNullOrEmpty(h))
+                {
+                    string p = h.Substring(0, 4);
+                    if (!prefixes.Contains(p) && prefixes.Count < 4) prefixes.Add(p);
+                }
+            }
+            string dst = _supervisor.AppleIdentityDirectory;
+            Directory.CreateDirectory(dst);
+            File.WriteAllText(Path.Combine(dst, "my_identifiers.txt"), string.Join("\n", cleanIds.ToArray()), Encoding.UTF8);
+            File.WriteAllText(Path.Combine(dst, "ble_hashes.txt"), string.Join(",", prefixes.ToArray()), Encoding.ASCII);
+            StopBeacon();
+            if (_beaconWanted) StartBeacon();
+        }
+        else if (cmd == "import_identity")
+        {
+            string src = Activation.QueryParam(uri, "dir");
+            if (!string.IsNullOrEmpty(src) && Directory.Exists(src))
+            {
+                string[] req = { "certificate.der", "key.pk8.der", "validation_record.cms" };
+                bool ok = true;
+                foreach (string f in req)
+                {
+                    if (!File.Exists(Path.Combine(src, f))) { ok = false; break; }
+                }
+                if (ok)
+                {
+                    string dst = _supervisor.AppleIdentityDirectory;
+                    Directory.CreateDirectory(dst);
+                    foreach (string f in new[] { "certificate.der", "key.pk8.der", "validation_record.cms", "intermediate.der", "contact_hashes.txt" })
+                    {
+                        string sp = Path.Combine(src, f);
+                        if (File.Exists(sp)) File.Copy(sp, Path.Combine(dst, f), true);
+                    }
+                    RestartReceiverOnly();
+                }
+            }
+        }
+        else if (cmd == "clear_identity")
+        {
+            try
+            {
+                if (Directory.Exists(_supervisor.AppleIdentityDirectory))
+                    Directory.Delete(_supervisor.AppleIdentityDirectory, true);
+            }
+            catch (Exception) { }
+            _prefs.SetReceiveMode("everyone");
+            RestartReceiverOnly();
+        }
+        else if (cmd == "add_contact")
+        {
+            string contact = Activation.QueryParam(uri, "contact");
+            string hash = NormalizeAndHashContact(contact);
+            if (!string.IsNullOrEmpty(hash))
+            {
+                string dst = _supervisor.AppleIdentityDirectory;
+                Directory.CreateDirectory(dst);
+                string file = Path.Combine(dst, "contact_hashes.txt");
+                var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (File.Exists(file))
+                {
+                    foreach (string line in File.ReadAllLines(file, Encoding.UTF8))
+                    {
+                        string t = line.Trim().ToLowerInvariant();
+                        if (t.Length == 64) set.Add(t);
+                    }
+                }
+                if (set.Add(hash))
+                {
+                    File.WriteAllText(file, string.Join(Environment.NewLine, new List<string>(set).ToArray()) + Environment.NewLine, new UTF8Encoding(false));
+                }
+            }
+        }
+        else if (cmd == "clear_contacts")
+        {
+            string file = Path.Combine(_supervisor.AppleIdentityDirectory, "contact_hashes.txt");
+            try { if (File.Exists(file)) File.Delete(file); }
+            catch (Exception) { }
+        }
+        else if (cmd == "exit")
+        {
+            Exit();
+            return;
+        }
+        WriteStatusJson();
+    }
+
+    private void OpenSendDialog(string[] initialFiles)
+    {
+        if (!_supervisor.Running)
+        {
+            _icon.ShowBalloonTip(4000, _icon.Text, "后端尚未就绪，请等待网卡初始化完成后再发送。", ToolTipIcon.Warning);
+        }
+        using (var dialog = new SendFilesDialog(_supervisor, _prefs, initialFiles))
+        {
+            dialog.ShowDialog();
+        }
+    }
+
+    private void ToggleSendTo()
+    {
+        bool enable = !AppIdentity.HasSendToShortcut();
+        string error;
+        if (AppIdentity.SetSendToShortcut(enable, out error))
+        {
+            _sendToItem.Checked = AppIdentity.HasSendToShortcut();
+        }
+        else
+        {
+            MessageBox.Show("设置右键「发送到」菜单失败：" + (error ?? "未知错误"),
+                "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
     private void RemoveRegistration()
     {
-        if (MessageBox.Show("删除开始菜单快捷方式和 dropbridge:// 协议？删除后系统通知里的按钮将不再可用。",
+        if (MessageBox.Show("删除开始菜单快捷方式、dropbridge:// 协议和右键「发送到」菜单项？",
                 "清理通知注册信息", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
         {
             return;
         }
+        string unused;
+        AppIdentity.SetSendToShortcut(false, out unused);
+        if (_sendToItem != null) _sendToItem.Checked = false;
         string error;
         bool removed = AppIdentity.RemoveRegistration(_supervisor.Root, out error);
         LogLine("notification registration removed: " + removed +
@@ -2058,6 +3574,11 @@ internal sealed class TrayApp : ApplicationContext
                 RedirectStandardError = true,
                 CreateNoWindow = true,
             };
+            start.EnvironmentVariables["DROPBRIDGE_BEACON_PULSE"] = Path.Combine(_supervisor.DataDirectory, "beacon.pulse");
+            start.EnvironmentVariables["DROPBRIDGE_IDENTITY_DIR"] = _supervisor.AppleIdentityDirectory;
+            string bleHashes = ReadSmallText(Path.Combine(_supervisor.AppleIdentityDirectory, "ble_hashes.txt"));
+            if (!string.IsNullOrEmpty(bleHashes))
+                start.EnvironmentVariables["DROPBRIDGE_BLE_HASHES"] = bleHashes;
             _beacon = Process.Start(start);
             _beaconStartedUtc = DateTime.UtcNow;
             ChildJob.Add(_beacon);
@@ -2384,27 +3905,54 @@ internal sealed class TrayApp : ApplicationContext
         {
             timer.Stop();
             timer.Dispose();
-            string service = RadioBinding.Service();
-            if (service == null)
+            RadioInspection info = RadioBinding.Inspect();
+            if (info.Target == null)
             {
                 _icon.ShowBalloonTip(6000, _icon.Text,
-                    "没找到 RTL8821CU 网卡：请直插机箱后面板的 USB 口。", ToolTipIcon.Warning);
+                    "没找到受支持的 RTL8821CU / RTL8811CU 网卡：请直插机箱后面板的 USB 口。", ToolTipIcon.Warning);
                 return;
             }
-            if (RadioBinding.Bound(service)) return;
+            if (RadioBinding.Bound(info.Service)) return;
 
-            DialogResult answer = MessageBox.Show(
-                "首次使用需要一次性安装驱动（把网卡的 Wi-Fi 接口绑定到 WinUSB）。\n\n" +
-                "点「是」后 Windows 会弹出一次管理员确认，安装完成后会自动继续。\n" +
-                "如果不想现在做，可以从托盘菜单选「安装驱动（首次使用）」。",
-                "DropBridge 首次使用", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-            if (answer == DialogResult.Yes) InstallDriver();
+            using (var dialog = new DriverSetupDialog(info))
+            {
+                if (dialog.ShowDialog() == DialogResult.OK) InstallDriver(true);
+            }
         };
         timer.Start();
     }
 
     private void InstallDriver()
     {
+        InstallDriver(false);
+    }
+
+    private void InstallDriver(bool alreadyConfirmed)
+    {
+        if (!alreadyConfirmed)
+        {
+            RadioInspection info = RadioBinding.Inspect();
+            if (info.Target == null)
+            {
+                MessageBox.Show(
+                    "没找到受支持的 RTL8821CU / RTL8811CU 网卡。\n" +
+                    "DropBridge 不会改动您电脑上的其他网卡。请直插机箱后面板的 USB 口后重试。",
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (RadioBinding.Bound(info.Service))
+            {
+                MessageBox.Show(
+                    info.Target.Name + " (" + info.Target.InterfaceLabel + ") 已绑定到 WinUSB，无需重复安装。",
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            using (var dialog = new DriverSetupDialog(info))
+            {
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+            }
+        }
+
         Cursor.Current = Cursors.WaitCursor;
         try
         {
@@ -2421,13 +3969,62 @@ internal sealed class TrayApp : ApplicationContext
             }
             else if (code == 3)
             {
-                MessageBox.Show("没找到 RTL8821CU 网卡。\n请直插机箱后面板的 USB 口后重试。",
+                MessageBox.Show("没找到 RTL8821CU / RTL8811CU 网卡。\n请直插机箱后面板的 USB 口后重试。",
                     "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             else
             {
-                MessageBox.Show("驱动安装没有完成，详见：\n" + DriverLog,
-                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                DialogResult revert = MessageBox.Show(
+                    "驱动安装没有完成，是否立即尝试恢复原厂 Wi-Fi 驱动状态？\n\n日志：\n" + DriverLog,
+                    "DropBridge", MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+                if (revert == DialogResult.Yes) RestoreDriver(true);
+            }
+        }
+        finally
+        {
+            Cursor.Current = Cursors.Default;
+        }
+    }
+
+    private void RestoreDriver()
+    {
+        RestoreDriver(false);
+    }
+
+    private void RestoreDriver(bool skipConfirm)
+    {
+        if (!skipConfirm)
+        {
+            RadioInspection info = RadioBinding.Inspect();
+            string targetLabel = info.Target != null
+                ? (info.Target.Name + " (" + info.DeviceId + ")")
+                : "已安装的 DropBridge WinUSB 驱动包";
+            DialogResult confirm = MessageBox.Show(
+                "将卸载 WinUSB 绑定并恢复网卡原厂 Realtek Wi-Fi 驱动：\n" + targetLabel + "\n\n" +
+                "恢复后 DropBridge 后端将停止运行，网卡可重新连接普通 Wi-Fi。\n是否继续？",
+                "恢复原厂 Wi-Fi 驱动", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirm != DialogResult.Yes) return;
+        }
+
+        _supervisor.StopAll();
+        Cursor.Current = Cursors.WaitCursor;
+        try
+        {
+            int code = RadioBinding.Restore(DriverLog);
+            if (code == 0)
+            {
+                MessageBox.Show("已恢复原厂 Wi-Fi 驱动，DropBridge 后端已停止。\n现在可以通过 Windows 连接普通 Wi-Fi。",
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else if (code == 2)
+            {
+                MessageBox.Show("需要管理员权限才能恢复驱动。\n也可以以管理员身份运行 setup\\Restore-WiFi.cmd。",
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            else
+            {
+                MessageBox.Show("恢复未完全确认，请查看日志或运行 setup\\Restore-WiFi.cmd：\n" + DriverLog,
+                    "DropBridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
         finally
@@ -2811,7 +4408,7 @@ internal sealed class TrayApp : ApplicationContext
             string here = Path.GetDirectoryName(Application.ExecutablePath);
             if (Directory.Exists(Path.Combine(here, "backend")))
             {
-                return "\"" + Application.ExecutablePath + "\"";
+                return "\"" + Application.ExecutablePath + "\" --silent";
             }
             string build = Path.GetDirectoryName(here);
             string appRoot = Path.GetDirectoryName(build);
@@ -2819,13 +4416,13 @@ internal sealed class TrayApp : ApplicationContext
             foreach (string name in new[] { "DropBridge.exe", "AirBridge32.exe" })
             {
                 string stub = Path.Combine(folder, name);
-                if (File.Exists(stub)) return "\"" + stub + "\"";
+                if (File.Exists(stub)) return "\"" + stub + "\" --silent";
             }
         }
         catch (ArgumentException)
         {
         }
-        return "\"" + Application.ExecutablePath + "\"";
+        return "\"" + Application.ExecutablePath + "\" --silent";
     }
 
     private static bool AutostartEnabled()
@@ -2904,14 +4501,33 @@ internal sealed class Settings
     public bool StillCopy { get; private set; }
     // Q65: where received files land; empty means <data>\received.
     public string ReceivedFolder { get; private set; }
+    // Q75/Q77: "auto" (everyone), "ask" (prompt), or "contacts".
+    public string ReceiveMode { get; private set; }
+    // Q77: "compatible" (JPEG/H.264) or "original" (HEIC/HEVC).
+    public string MediaFormat { get; private set; }
+    // Q78: sound & bottom-right toast/balloon notification on received files.
+    public bool NotifySound { get; private set; }
+    public bool NotifyToast { get; private set; }
 
-    private Settings(string path, string deviceName, bool beacon, bool stillCopy, string receivedFolder)
+    private Settings(string path, string deviceName, bool beacon, bool stillCopy, string receivedFolder, string receiveMode, string mediaFormat, bool notifySound, bool notifyToast)
     {
         _path = path;
         DeviceName = deviceName;
         Beacon = beacon;
         StillCopy = stillCopy;
         ReceivedFolder = receivedFolder;
+        ReceiveMode = NormalizeReceiveMode(receiveMode);
+        MediaFormat = mediaFormat == "original" ? "original" : "compatible";
+        NotifySound = notifySound;
+        NotifyToast = notifyToast;
+    }
+
+    private static string NormalizeReceiveMode(string mode)
+    {
+        if (string.IsNullOrEmpty(mode)) return "auto";
+        string m = mode.Trim().ToLowerInvariant();
+        if (m == "contacts" || m == "ask") return m;
+        return "auto";
     }
 
     public static Settings Load(string dataDirectory)
@@ -2921,6 +4537,10 @@ internal sealed class Settings
         bool beacon = true;
         bool stillCopy = true;
         string receivedFolder = "";
+        string receiveMode = "auto";
+        string mediaFormat = "compatible";
+        bool notifySound = true;
+        bool notifyToast = true;
         try
         {
             if (File.Exists(path))
@@ -2953,6 +4573,24 @@ internal sealed class Settings
                         // An unusable path in a hand-edited file falls back to the default.
                         receivedFolder = CleanFolder(value) ?? "";
                     }
+                    else if (key.Equals("receiveMode", StringComparison.OrdinalIgnoreCase))
+                    {
+                        receiveMode = NormalizeReceiveMode(value);
+                    }
+                    else if (key.Equals("mediaFormat", StringComparison.OrdinalIgnoreCase))
+                    {
+                        mediaFormat = value.Equals("original", StringComparison.OrdinalIgnoreCase) ? "original" : "compatible";
+                    }
+                    else if (key.Equals("notifySound", StringComparison.OrdinalIgnoreCase))
+                    {
+                        bool on;
+                        if (bool.TryParse(value, out on)) notifySound = on;
+                    }
+                    else if (key.Equals("notifyToast", StringComparison.OrdinalIgnoreCase))
+                    {
+                        bool on;
+                        if (bool.TryParse(value, out on)) notifyToast = on;
+                    }
                 }
             }
             else if (File.Exists(Path.Combine(dataDirectory, "beacon-off")))
@@ -2964,7 +4602,7 @@ internal sealed class Settings
         catch (Exception)
         {
         }
-        return new Settings(path, deviceName, beacon, stillCopy, receivedFolder);
+        return new Settings(path, deviceName, beacon, stillCopy, receivedFolder, receiveMode, mediaFormat, notifySound, notifyToast);
     }
 
     public void SetDeviceName(string name)
@@ -2988,6 +4626,30 @@ internal sealed class Settings
     public void SetReceivedFolder(string folder)
     {
         ReceivedFolder = folder ?? "";
+        Save();
+    }
+
+    public void SetReceiveMode(string mode)
+    {
+        ReceiveMode = NormalizeReceiveMode(mode);
+        Save();
+    }
+
+    public void SetMediaFormat(string format)
+    {
+        MediaFormat = format == "original" ? "original" : "compatible";
+        Save();
+    }
+
+    public void SetNotifySound(bool enabled)
+    {
+        NotifySound = enabled;
+        Save();
+    }
+
+    public void SetNotifyToast(bool enabled)
+    {
+        NotifyToast = enabled;
         Save();
     }
 
@@ -3029,6 +4691,10 @@ internal sealed class Settings
                 text.AppendLine("beacon=" + (Beacon ? "true" : "false"));
                 text.AppendLine("stillCopy=" + (StillCopy ? "true" : "false"));
                 text.AppendLine("receivedFolder=" + ReceivedFolder);
+                text.AppendLine("receiveMode=" + ReceiveMode);
+                text.AppendLine("mediaFormat=" + MediaFormat);
+                text.AppendLine("notifySound=" + (NotifySound ? "true" : "false"));
+                text.AppendLine("notifyToast=" + (NotifyToast ? "true" : "false"));
                 File.WriteAllText(_path, text.ToString(), new UTF8Encoding(false));
             }
             catch (Exception)
@@ -3183,6 +4849,67 @@ internal static class AppIdentity
         return RunScript(root, "register.ps1", "", out error);
     }
 
+    public static string SendToLinkPath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.SendTo),
+            "DropBridge.lnk");
+    }
+
+    public static bool HasSendToShortcut()
+    {
+        return File.Exists(SendToLinkPath());
+    }
+
+    public static bool SetSendToShortcut(bool enable, out string error)
+    {
+        error = null;
+        string linkPath = SendToLinkPath();
+        try
+        {
+            if (!enable)
+            {
+                if (File.Exists(linkPath)) File.Delete(linkPath);
+                return true;
+            }
+            string exe = Application.ExecutablePath;
+            string script =
+                "$w = New-Object -ComObject WScript.Shell; " +
+                "$s = $w.CreateShortcut('" + linkPath.Replace("'", "''") + "'); " +
+                "$s.TargetPath = '" + exe.Replace("'", "''") + "'; " +
+                "$s.Arguments = '--send'; " +
+                "$s.WorkingDirectory = '" + Path.GetDirectoryName(exe).Replace("'", "''") + "'; " +
+                "$s.Description = '使用 DropBridge 隔空投送发送文件'; " +
+                "$s.Save()";
+            var start = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -NonInteractive -Command \"" + script.Replace("\"", "\\\"") + "\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            int exitCode;
+            string stderr;
+            if (!HiddenProcess.Run(start, 15000, out exitCode, out stderr))
+            {
+                error = "timed out";
+                return false;
+            }
+            if (exitCode != 0)
+            {
+                error = stderr;
+                return false;
+            }
+            return File.Exists(linkPath);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
     public static bool RemoveRegistration(string root, out string error)
     {
         error = null;
@@ -3293,6 +5020,79 @@ internal static class Activation
         });
         thread.IsBackground = true;
         thread.Start();
+    }
+
+    public static bool IsUiUri(string uri)
+    {
+        return !string.IsNullOrEmpty(uri) &&
+               uri.StartsWith(Scheme + "ui", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static string QueryParam(string uri, string key)
+    {
+        try
+        {
+            var parsed = new Uri(uri);
+            string query = parsed.Query.TrimStart('?');
+            foreach (string pair in query.Split('&'))
+            {
+                int at = pair.IndexOf('=');
+                if (at <= 0) continue;
+                if (!pair.Substring(0, at).Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+                return Uri.UnescapeDataString(pair.Substring(at + 1).Replace("+", "%2B"));
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return null;
+    }
+
+    public static bool IsSendUri(string uri)
+    {
+        return !string.IsNullOrEmpty(uri) &&
+               uri.StartsWith(Scheme + "send", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static string BuildSendUri(string[] files)
+    {
+        var sb = new StringBuilder(Scheme);
+        sb.Append("send?");
+        if (files != null)
+        {
+            bool first = true;
+            foreach (string f in files)
+            {
+                if (string.IsNullOrEmpty(f)) continue;
+                if (!first) sb.Append('&');
+                sb.Append("file=");
+                sb.Append(Uri.EscapeDataString(f));
+                first = false;
+            }
+        }
+        return sb.ToString();
+    }
+
+    public static string[] FilesFromSendUri(string uri)
+    {
+        var list = new List<string>();
+        try
+        {
+            var parsed = new Uri(uri);
+            string query = parsed.Query.TrimStart('?');
+            foreach (string pair in query.Split('&'))
+            {
+                int at = pair.IndexOf('=');
+                if (at <= 0) continue;
+                if (!pair.Substring(0, at).Equals("file", StringComparison.OrdinalIgnoreCase)) continue;
+                string decoded = Uri.UnescapeDataString(pair.Substring(at + 1).Replace("+", "%2B"));
+                if (!string.IsNullOrEmpty(decoded)) list.Add(decoded);
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return list.ToArray();
     }
 
     /* dropbridge://copy?file=<url encoded path> */
@@ -3465,6 +5265,7 @@ internal static class Program
     /* Set when the process was started by the toast button and no tray was
      * running yet; TrayApp replays it once the UI is up. */
     internal static string PendingActivation;
+    internal static bool SilentMode;
 
     [STAThread]
     private static int Main(string[] args)
@@ -3479,6 +5280,18 @@ internal static class Program
             PendingActivation = activation;
             args = new string[0];
         }
+        else if (args.Length > 0 && args[0] == "--send")
+        {
+            var sendFiles = new List<string>();
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (!string.IsNullOrEmpty(args[i])) sendFiles.Add(args[i]);
+            }
+            string sendUri = Activation.BuildSendUri(sendFiles.ToArray());
+            if (Activation.Send(sendUri)) return 0;
+            PendingActivation = sendUri;
+            args = new string[0];
+        }
 
         string rootArgument = null;
         string output = null;
@@ -3490,7 +5303,7 @@ internal static class Program
         int width = 20;
         string channelSequence = "social";
         bool tcpMerge = true;
-        bool allowSend = false;
+        bool allowSend = true;
         int streams = 1;
         string dataArgument = null;
         for (int index = 0; index < args.Length; index++)
@@ -3532,6 +5345,9 @@ internal static class Program
                 case "--allow-send":
                     allowSend = true;
                     break;
+                case "--no-send":
+                    allowSend = false;
+                    break;
                 case "--streams":
                     // Diagnostic A/B of what awdld advertises; 1 is the honest
                     // value for this 1T1R radio and stays the default.
@@ -3560,11 +5376,29 @@ internal static class Program
                             : installLog;
                         return RadioBinding.Install(resolved, quiet, log);
                     }
+                case "--restore-driver":
+                    {
+                        string restoreRoot = null;
+                        string restoreLog = null;
+                        for (int extra = index + 1; extra < args.Length; extra++)
+                        {
+                            if (args[extra] == "--root" && extra + 1 < args.Length) restoreRoot = args[++extra];
+                            else if (args[extra] == "--log" && extra + 1 < args.Length) restoreLog = args[++extra];
+                        }
+                        string resolved = ResolveRoot(restoreRoot);
+                        string log = string.IsNullOrEmpty(restoreLog)
+                            ? Path.Combine(resolved, "data", "logs", "driver-install.txt")
+                            : restoreLog;
+                        return RadioBinding.Restore(log);
+                    }
                 case "--autostart-on":
                     autostart = 1;
                     break;
                 case "--autostart-off":
                     autostart = -1;
+                    break;
+                case "--silent":
+                    SilentMode = true;
                     break;
             }
         }
@@ -3594,8 +5428,8 @@ internal static class Program
         string[] knownSwitches =
         {
             "--root", "--data", "--check", "--out", "--smoke", "--auto-exit",
-            "--channel", "--width", "--chanseq", "--no-tcp-merge", "--allow-send",
-            "--autostart-on", "--autostart-off", "--install-driver", "--streams",
+            "--channel", "--width", "--chanseq", "--no-tcp-merge", "--allow-send", "--no-send", "--send",
+            "--autostart-on", "--autostart-off", "--install-driver", "--restore-driver", "--streams", "--silent",
         };
         if (args.Length > 0 && Array.IndexOf(knownSwitches, args[0]) < 0)
         {

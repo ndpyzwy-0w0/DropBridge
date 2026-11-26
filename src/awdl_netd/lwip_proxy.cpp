@@ -123,6 +123,11 @@ void proxy_connection(int lwip_fd, tcp_diag::Key key) {
 int g_mdns_fd = -1;
 intptr_t g_mdns_local = -1;
 std::mutex g_peer_mu;
+// Non-query mDNS speaker (receiver.py announcer): incoming queries go here.
+uint32_t g_announcer_ip = 0;
+uint16_t g_announcer_port = 0;
+bool g_have_announcer = false;
+// Fallback last local speaker when no dedicated announcer is known yet.
 uint32_t g_peer_ip = 0;
 uint16_t g_peer_port = 0;
 bool g_have_peer = false;
@@ -172,6 +177,10 @@ void mdns_from_local() {
                 g_querier_ip = ip;
                 g_querier_port = port;
                 g_have_querier = true;
+            } else {
+                g_announcer_ip = ip;
+                g_announcer_port = port;
+                g_have_announcer = true;
             }
         }
         if (mdns_debug()) {
@@ -207,6 +216,10 @@ void mdns_from_awdl() {
             if (answer && g_have_querier) {
                 ip = g_querier_ip;
                 port = g_querier_port;
+                routed = true;
+            } else if (!answer && g_have_announcer) {
+                ip = g_announcer_ip;
+                port = g_announcer_port;
                 routed = true;
             } else if (g_have_peer) {
                 ip = g_peer_ip;
@@ -311,6 +324,8 @@ void outbound_connection(intptr_t local) {
         local_tcp_close(local);
         return;
     }
+    int nodelay = 1;
+    lwip_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     std::atomic<bool> stop{false};
     std::thread up([&] { // local bytes -> lwIP

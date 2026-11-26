@@ -13,6 +13,8 @@ function Find-CMake {
         'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe',
         'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     )
+    $sdkCmake = Get-ChildItem 'D:\Android_SDK\cmake\*\bin\cmake.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($sdkCmake) { $candidates = @($sdkCmake) + $candidates }
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate) { return $candidate }
     }
@@ -23,8 +25,7 @@ $vcpkg = Join-Path $root 'build\deps\vcpkg'
 & $cmake -S (Join-Path $root 'src\radio_usb') -B (Join-Path $root 'build\radio_usb') `
     -G 'Visual Studio 17 2022' -A x64 `
     "-DCMAKE_TOOLCHAIN_FILE=$vcpkg\scripts\buildsystems\vcpkg.cmake" `
-    "-DPKG_CONFIG_EXECUTABLE=$vcpkg\installed\x64-windows\tools\pkgconf\pkgconf.exe" `
-    '-DPKG_CONFIG_ARGN=--msvc-syntax'
+    "-DPKG_CONFIG_EXECUTABLE=$vcpkg\installed\x64-windows\tools\pkgconf\pkgconf.exe"
 if ($LASTEXITCODE -ne 0) { throw 'radio configure failed' }
 & $cmake --build (Join-Path $root 'build\radio_usb') --config Release --parallel 8 `
     --target airbridge_radio radio_pipe_bridge peer_telemetry_test channel_completion_test

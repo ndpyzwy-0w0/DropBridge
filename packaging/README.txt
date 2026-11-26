@@ -8,7 +8,7 @@ DropBridge —— iPhone 隔空投送接收端（Windows，托盘常驻）
 
 运行条件
   - Windows 10 / 11，64 位。
-  - 一张 RTL8821CU 芯片的 USB 无线网卡（本项目验证过 0bda:c820）。
+  - 一张受支持的 USB 无线网卡：RTL8821CU（0bda:c820）或 RTL8811CU（0bda:c811）。
     DropBridge 只用这张网卡，不影响电脑原来的 Wi-Fi。
 
 第一次运行

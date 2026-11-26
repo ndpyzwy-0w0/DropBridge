@@ -15,20 +15,20 @@
 
 为什么要装驱动
 --------------
-这个程序绕开 Windows 自带驱动，直接用 libusb 跟 RTL8821CU 网卡说话，才能收发
+这个程序绕开 Windows 自带驱动，直接用 libusb 跟 RTL8821CU / RTL8811CU 网卡说话，才能收发
 AWDL（隔空投送）帧。Windows 默认给这个网卡的 Wi-Fi 接口装的是 Realtek 网络驱动，
 libusb 打不开它，所以第一次要换成 WinUSB。驱动本身是 Windows 自带的 winusb.sys，
 我们只是把「这个接口用 WinUSB」写进注册表一样的驱动库。
 
-⚠️ 只换一个接口
----------------
-你的网卡是一个「复合设备」，有三个接口：
-
+⚠️ 只换 Wi-Fi 接口
+------------------
+- **RTL8821CU（0bda:c820）** 是一个「复合设备」，有三个接口：
   MI_00   蓝牙        ← 绝对不要动（这个程序不用它）
   MI_01   厂商预留    ← 不要动
   MI_02   Wi-Fi       ← **只换这一个**
+- **RTL8811CU（0bda:c811）** 是单接口纯 Wi-Fi 网卡（无 MI_xx，也不带蓝牙），直接选它即可。
 
-自动安装只会碰 MI_02；手动用 Zadig 时也请只选 MI_02。
+自动安装只会碰 Wi-Fi 接口；手动用 Zadig 时也请只选 Wi-Fi 项。
 
 手动兜底（自动安装失败时）
 --------------------------
@@ -38,8 +38,9 @@ libusb 打不开它，所以第一次要换成 WinUSB。驱动本身是 Windows 
    - 它说没绑好，会打开 Zadig。
 3. 在 Zadig 里：
    a) 菜单 `Options` → 勾上 `List All Devices`；
-   b) 上方下拉框里找 **`RTL8821CU` / `802.11ac NIC`**（USB ID `0BDA C820`，接口 `MI_02`）；
-      **不要选** `USB Composite Device`，**不要选**带 `Bluetooth` 的项；
+   b) 上方下拉框里找 **`RTL8821CU` / `RTL8811CU` / `802.11ac NIC`**：
+      - 8821CU：USB ID `0BDA C820`，接口 **`MI_02`**（**不要选** `USB Composite Device` 或带 `Bluetooth` 的项）
+      - 8811CU：USB ID `0BDA C811`（单接口，直接选它即可）
    c) 目标驱动确认是 **`WinUSB`**；
    d) 点 **`Replace Driver`**，等 1–2 分钟，中途别拔网卡。
 4. 回到脚本窗口按回车，它会复查：
@@ -48,9 +49,13 @@ libusb 打不开它，所以第一次要换成 WinUSB。驱动本身是 Windows 
 
 怎么恢复原驱动（后悔药）
 ------------------------
-设备管理器 → 找到 `RTL8821CU` / `802.11ac NIC` → 右键 → 卸载设备 →
-勾「删除此设备的驱动程序软件」→ 确定 → 拔插网卡 → Windows 自动装回 Realtek
-网络驱动。之后 Wi-Fi 恢复正常，DropBridge 不再能用。
+方法 1（一键脚本，推荐）：双击本文件夹里的 `Restore-WiFi.cmd`，按提示允许管理员权限，
+脚本会自动卸载 DropBridge 的 WinUSB 驱动包并重新扫描恢复原厂 Realtek Wi-Fi 驱动。
+（也可以在 DropBridge 托盘菜单点「恢复原厂 Wi-Fi 驱动…」。）
+
+方法 2（手动）：设备管理器 → 找到 `RTL8821CU` / `RTL8811CU` / `802.11ac NIC` → 右键 →
+卸载设备 → 勾「删除此设备的驱动程序软件」→ 确定 → 拔插网卡 → Windows 自动装回
+Realtek 网络驱动。之后 Wi-Fi 恢复正常，DropBridge 不再能用。
 
 关于这里的文件
 --------------

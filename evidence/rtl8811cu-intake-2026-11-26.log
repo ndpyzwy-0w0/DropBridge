@@ -1,0 +1,29 @@
+# RTL8811CU 本机只读基线与离线验证记录（2026-11-26）
+
+1. 设备实例与属性（只读 Get-PnpDevice / Get-PnpDeviceProperty）：
+   - InstanceId: USB\VID_0BDA&PID_C811\123456
+   - HardwareIds: USB\VID_0BDA&PID_C811&REV_0200, USB\VID_0BDA&PID_C811
+   - CompatibleIds: USB\COMPAT_VID_0BDA&Class_FF&SubClass_FF&Prot_FF ...
+   - Service: RtlWlanu
+   - DriverInfPath: oem302.inf
+   - DriverVersion: 1030.52.1216.2025
+   - Parent: USB\ROOT_HUB30\4&185823ff&0&0
+   - NetAdapter: WLAN 6 (Realtek 8811CU Wireless LAN 802.11ac USB NIC, Disconnected)
+   - Host Bluetooth: Intel(R) Wireless Bluetooth(R) (OK)
+   - Host Primary Wi-Fi: WLAN (Intel(R) Wi-Fi 7 BE200 320MHz, Up)
+   - ZeroCD (0bda:1a2b): 未观察到
+
+2. 离线验证：
+   - Build-Supervisor.ps1 -Test:
+     - supervisor: build\supervisor\Release\DropBridge.exe (118 KB)
+     - PASS channel_sequence (3 cases)
+     - PASS tray_icon
+     - PASS settings
+     - PASS radio_binding
+   - Build-DriverPackage.ps1:
+     - 重新签名 packaging\driver\airbridge-winusb.cat (thumbprint EBD283AF72BAAB38171AD60F38C136C2A4C2148E)
+   - packaging\setup\Check-Binding.ps1: exit 1 (RTL8811CU using RtlWlanu)
+   - tools\Check-Binding.ps1: exit 1 (RTL8811CU Wi-Fi non-composite, oem302.inf)
+
+3. 回滚方案（换驱动前记录）：
+   设备管理器 -> 通用串行总线设备 -> 卸载 8811CU 并勾选“删除此设备的驱动程序软件”-> 拔插或 pnputil /scan-devices，恢复使用 oem302.inf / RtlWlanu。

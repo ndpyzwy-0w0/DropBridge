@@ -23,6 +23,8 @@ function Find-CMake {
         'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe',
         'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     )
+    $sdkCmake = Get-ChildItem 'D:\Android_SDK\cmake\*\bin\cmake.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+    if ($sdkCmake) { $candidates = @($sdkCmake) + $candidates }
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate) { return $candidate }
     }
@@ -35,7 +37,12 @@ $mingw = Get-ChildItem (Join-Path $root 'build\deps\vcpkg\downloads\tools\perl')
     ForEach-Object { Join-Path $_.FullName 'c\bin' } |
     Where-Object { Test-Path (Join-Path $_ 'gcc.exe') } |
     Select-Object -First 1
-if (-not $mingw) { throw 'Portable MinGW not found under build/deps/vcpkg/downloads/tools/perl' }
+if (-not $mingw -and (Test-Path 'D:\mingw64\bin\gcc.exe')) { $mingw = 'D:\mingw64\bin' }
+if (-not $mingw) {
+    $gccCmd = Get-Command gcc.exe -ErrorAction SilentlyContinue
+    if ($gccCmd) { $mingw = Split-Path $gccCmd.Source -Parent }
+}
+if (-not $mingw) { throw 'MinGW gcc.exe not found' }
 if (-not (Test-Path (Join-Path $repo 'upstream\owl\radiotap\radiotap.c'))) {
     throw 'OWL/radiotap submodule missing; run git -C upstream/winawdl submodule update --init --recursive'
 }
@@ -50,6 +57,7 @@ $configure = @(
     '-G', 'MinGW Makefiles',
     "-DCMAKE_C_COMPILER=$(Join-Path $mingw 'gcc.exe')",
     "-DCMAKE_MAKE_PROGRAM=$(Join-Path $mingw 'mingw32-make.exe')",
+    '-DCMAKE_C_STANDARD_LIBRARIES=-lwinpthread',
     '-DCMAKE_BUILD_TYPE=Release',
     # The option defaults OFF (Wintun backend); set it every time so a fresh
     # build directory produces the awdld the product chain needs.

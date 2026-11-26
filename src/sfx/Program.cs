@@ -192,11 +192,12 @@ internal static class Program
                 Console.Error.WriteLine("DropBridge: no launcher in " + target);
                 return 2;
             }
+            string extraArgs = args.Length > 0 ? (" " + string.Join(" ", args)) : "";
             var start = new ProcessStartInfo(launcher)
             {
                 WorkingDirectory = target,
                 UseShellExecute = true,
-                Arguments = "--root \"" + target + "\" --data \"" + DataDir() + "\"",
+                Arguments = "--root \"" + target + "\" --data \"" + DataDir() + "\"" + extraArgs,
             };
             Process.Start(start);
             PruneOldBuilds(target);

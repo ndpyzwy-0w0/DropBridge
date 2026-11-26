@@ -11,7 +11,7 @@ if errorlevel 1 (
 )
 
 echo ----------------------------------------------------------------
-echo  DropBridge one-time setup: the RTL8821CU Wi-Fi interface
+echo  DropBridge one-time setup: bind Wi-Fi interface to WinUSB
 echo ----------------------------------------------------------------
 echo.
 echo %DATE% %TIME% > setup.log
@@ -37,8 +37,10 @@ if "%CODE%"=="0" (
 echo.
 echo Zadig will open now. In Zadig:
 echo   1. Options -^> List All Devices
-echo   2. pick   RTL8821CU / 802.11ac NIC   (USB ID 0BDA C820, interface MI_02)
-echo        do NOT pick "USB Composite Device", do NOT pick anything "Bluetooth"
+echo   2. pick your adapter's Wi-Fi entry:
+echo      - RTL8821CU: 802.11ac NIC (USB ID 0BDA C820, interface MI_02)
+echo      - RTL8811CU: 802.11ac NIC (USB ID 0BDA C811, single interface)
+echo      do NOT pick "USB Composite Device", do NOT pick anything "Bluetooth"
 echo   3. target driver stays   WinUSB
 echo   4. press   Replace Driver   and wait for it to finish
 echo.
